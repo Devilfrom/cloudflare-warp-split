@@ -7,3 +7,7 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+
+# 本机个人配置与自定义规则列表（因人而异，勿提交）
+settings.json
+rules/

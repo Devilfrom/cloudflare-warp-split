@@ -7,19 +7,22 @@ Cloudflare WARP 智能分流控制台 —— 后端
   - 国际流量走 Cloudflare WARP 出口 (warp 全隧道)
   - 国内 (中国大陆) 流量直连 (通过 WARP split-tunnel 排除规则)
   - 可视化控制台 (index.html) + 一键开关 / 一键还原
-  - 自动以管理员身份运行 (修改路由需要权限)
+  - 开机自启 (计划任务) / 断线自动重连 / 系统托盘 / 速率·延迟监控
+  - 规则列表导入与管理 / 后台自动更新规则 / 暗亮主题 / Zero Trust 检测
 
 技术要点:
-  - 仅依赖 Python 标准库
-  - 启用: disconnect -> mode warp -> connect -> 并发注入 china_cidr.txt 中的中国 IP 到 WARP 排除列表
-  - 停用/还原: disconnect + tunnel ip reset (瞬间清空自定义排除, 比逐条删除快得多)
-  - 状态持久化到 state.json, 异常自动回滚
+  - 仅依赖 Python 标准库 (托盘用 ctypes, 无需第三方包)
+  - 启用: disconnect -> mode warp -> connect -> 并发注入中国 IP 到 WARP 排除列表
+  - 停用/还原: disconnect + tunnel ip reset (瞬间清空自定义排除)
+  - 状态持久化到 state.json / settings.json, 异常自动回滚
 """
 
 import os
 import sys
+import re
 import json
 import time
+import struct
 import threading
 import subprocess
 import logging
@@ -38,7 +41,9 @@ WARP_CLI_CANDIDATES = [
     r"D:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe",
 ]
 CHINA_LIST = os.path.join(APP_DIR, "china_cidr.txt")
+RULES_DIR = os.path.join(APP_DIR, "rules")
 STATE_FILE = os.path.join(APP_DIR, "state.json")
+SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 LOG_FILE = os.path.join(APP_DIR, "warp_split.log")
 PORT = int(os.environ.get("WARP_SPLIT_PORT", "8777"))
 WORKERS = int(os.environ.get("WARP_SPLIT_WORKERS", "20"))
@@ -50,6 +55,8 @@ EGRESS_SERVICES = [
     "https://myip.ipip.net",
     "https://ipinfo.io/ip",
 ]
+SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes=25000000"
+AUTOSTART_TASK = "CloudflareWARP-Split"
 
 # ====================== 全局状态 ======================
 state = {
@@ -57,13 +64,39 @@ state = {
     "running": False,
     "action": None,
     "progress": {"total": 0, "done": 0, "phase": "空闲"},
-    "added_ranges": [],
     "error": None,
+    "reconnecting": False,
+    "zerotrust_locked": False,
 }
 state_lock = threading.Lock()
 op_stop = threading.Event()
+EXIT_EVENT = threading.Event()
 log_lines = []
 log_lock = threading.Lock()
+
+# 设置 (持久化到 settings.json)
+settings = {
+    "theme": "dark",
+    "auto_reconnect": True,
+    "auto_update": False,
+    "metrics_speed": True,
+    "tray": True,
+    "active_lists": ["china_cidr.txt"],
+}
+
+# 指标 (内存态, 不持久化)
+metrics = {
+    "latency_cn": None,
+    "latency_intl": None,
+    "dl_speed_mbps": None,
+    "egress_ip": "—",
+    "uptime_s": 0,
+    "connected_since": None,
+    "start_ts": time.time(),
+    "last_speed_ts": 0,
+}
+metrics_history = []  # 近 60 个采样点 {t,cn,intl,spd}
+metrics_lock = threading.Lock()
 
 # ====================== 日志 ======================
 logger = logging.getLogger("warp_split")
@@ -87,7 +120,6 @@ def find_warp_cli():
     for p in WARP_CLI_CANDIDATES:
         if os.path.exists(p):
             return p
-    # PATH 中查找
     try:
         r = subprocess.run(["where", "warp-cli"], capture_output=True, text=True, timeout=10)
         if r.returncode == 0 and r.stdout.strip():
@@ -125,12 +157,10 @@ def restart_warp_service():
         return False
 
 
-def read_china_list():
-    if not os.path.exists(CHINA_LIST):
-        return []
+def read_list_file(path):
     out = []
     try:
-        with open(CHINA_LIST, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -145,6 +175,29 @@ def read_china_list():
     return out
 
 
+def read_china_list():
+    return read_list_file(CHINA_LIST)
+
+
+def read_active_ranges():
+    """读取所有"激活"的规则列表 (默认 china_cidr.txt + 自定义导入列表)。"""
+    ranges = []
+    for name in settings.get("active_lists", ["china_cidr.txt"]):
+        if not name:
+            continue
+        p = name if os.path.isabs(name) else os.path.join(APP_DIR, name)
+        if os.path.exists(p):
+            ranges += read_list_file(p)
+    # 去重保序
+    seen = set()
+    uniq = []
+    for r in ranges:
+        if r not in seen:
+            seen.add(r)
+            uniq.append(r)
+    return uniq
+
+
 def get_egress_ip():
     import urllib.request
     import ssl
@@ -154,9 +207,8 @@ def get_egress_ip():
     for url in EGRESS_SERVICES:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
                 data = resp.read().decode("utf-8", "ignore").strip()
-                # 有的服务返回 "当前 IP：1.2.3.4 来自..."
                 import re
                 m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", data)
                 if m:
@@ -172,6 +224,52 @@ def save_state():
             json.dump({"enabled": state["enabled"]}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def load_settings():
+    global settings
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                for k, v in d.items():
+                    settings[k] = v
+    except Exception:
+        pass
+
+
+def save_settings():
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def load_state():
+    """从 state.json 恢复 enabled 标志 (进程重启后仍能正确反映实时分流状态)。"""
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                state["enabled"] = bool(d.get("enabled", False))
+    except Exception:
+        pass
+
+
+def tcp_rtt(host, port=443, timeout=1.0):
+    """TCP 握手 RTT (ms), 作为 ICMP 不可达时的延迟兜底。"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        t = time.time()
+        s.connect((host, port))
+        rtt = (time.time() - t) * 1000.0
+        s.close()
+        return round(rtt, 1)
+    except Exception:
+        return None
 
 
 # ====================== 分流自检 / IPv6 修复 ======================
@@ -246,8 +344,7 @@ def self_test():
 
 
 def fix_ipv6():
-    """禁用 CloudflareWARP 虚拟适配器的 IPv6, 解决 WARP 连接卡在 happy eyeballs 的问题。
-    可逆: 再次调用 set interface <idx> enabled 即可恢复。"""
+    """禁用 CloudflareWARP 虚拟适配器的 IPv6, 解决 WARP 连接卡在 happy eyeballs 的问题。"""
     import re
     try:
         r = subprocess.run(["netsh", "interface", "ipv6", "show", "interfaces"],
@@ -270,16 +367,57 @@ def fix_ipv6():
         return False, str(e)
 
 
-
-def load_state():
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                state["enabled"] = bool(d.get("enabled", False))
-                state["added_ranges"] = d.get("added_ranges", [])
-    except Exception:
-        pass
+# ====================== 连接 / 重连 ======================
+def connect_warp(max_attempts=4, update_phase=True):
+    """连接 WARP, 带『断重连 + 服务重启』兜底。返回 (connected, last_out)。"""
+    connected = False
+    last_out = ""
+    for attempt in range(1, max_attempts + 1):
+        if op_stop.is_set():
+            return False, "用户取消了操作"
+        if update_phase:
+            with state_lock:
+                state["progress"] = {"total": 0, "done": 0,
+                                     "phase": f"正在连接 WARP 隧道 (第 {attempt}/{max_attempts} 次尝试)..."}
+        log(f"尝试连接 WARP (第 {attempt}/{max_attempts} 次)...")
+        warp(["disconnect"], timeout=20)
+        time.sleep(2)
+        ok, out = warp(["--accept-tos", "connect"], timeout=30)
+        log("connect: " + out)
+        for _ in range(18):
+            if op_stop.is_set():
+                return False, "用户取消了操作"
+            ok, out = warp(["status"], timeout=10)
+            last_out = out
+            with state_lock:
+                state["warp_status"] = out.replace("\n", " ")
+            if "Connected" in out:
+                connected = True
+                break
+            time.sleep(2)
+        if connected:
+            break
+        log(f"第 {attempt} 次连接未成功 (状态: {last_out[:90]})", logging.WARNING)
+    if not connected:
+        log("常规重试未连上, 尝试重启 CloudflareWARP 服务...", logging.WARNING)
+        restart_warp_service()
+        warp(["mode", "warp"], timeout=20)
+        time.sleep(1)
+        warp(["disconnect"], timeout=20)
+        time.sleep(2)
+        warp(["--accept-tos", "connect"], timeout=30)
+        for _ in range(18):
+            if op_stop.is_set():
+                return False, "用户取消了操作"
+            ok, out = warp(["status"], timeout=10)
+            last_out = out
+            with state_lock:
+                state["warp_status"] = out.replace("\n", " ")
+            if "Connected" in out:
+                connected = True
+                break
+            time.sleep(2)
+    return connected, last_out
 
 
 # ====================== 核心操作 ======================
@@ -298,69 +436,16 @@ def enable_split():
             raise RuntimeError("未找到 warp-cli.exe，请确认 Cloudflare WARP 已安装")
         log("WARP 路径: " + cli)
 
-        # 1) 确保断开, 避免模式切换冲突
         warp(["disconnect"], timeout=20)
         time.sleep(2)
 
-        # 2) 设置为全隧道模式
         ok, out = warp(["mode", "warp"], timeout=20)
         if not ok:
             log("设置 mode warp 返回: " + out, logging.WARNING)
         else:
             log("mode warp 设置完成")
 
-        # 3) 连接 WARP (happy eyeballs 偶发卡住, 采用『断重连 + 服务重启』兜底)
-        with state_lock:
-            state["progress"] = {"total": 0, "done": 0, "phase": "正在连接 WARP 隧道..."}
-        connected = False
-        last_out = ""
-        max_attempts = 4
-        for attempt in range(1, max_attempts + 1):
-            if op_stop.is_set():
-                raise RuntimeError("用户取消了操作")
-            with state_lock:
-                state["progress"] = {"total": 0, "done": 0,
-                                     "phase": f"正在连接 WARP 隧道 (第 {attempt}/{max_attempts} 次尝试)..."}
-            log(f"尝试连接 WARP (第 {attempt}/{max_attempts} 次)...")
-            warp(["disconnect"], timeout=20)
-            time.sleep(2)
-            ok, out = warp(["--accept-tos", "connect"], timeout=30)
-            log("connect: " + out)
-            # 轮询连接状态 (单次尝试最多等 ~36s)
-            for _ in range(18):
-                if op_stop.is_set():
-                    raise RuntimeError("用户取消了操作")
-                ok, out = warp(["status"], timeout=10)
-                last_out = out
-                with state_lock:
-                    state["warp_status"] = out.replace("\n", " ")
-                if "Connected" in out:
-                    connected = True
-                    break
-                time.sleep(2)
-            if connected:
-                break
-            log(f"第 {attempt} 次连接未成功 (状态: {last_out[:90]})", logging.WARNING)
-        # 兜底: 重启 CloudflareWARP 服务后最后再试一次
-        if not connected:
-            log("常规重试未连上, 尝试重启 CloudflareWARP 服务...", logging.WARNING)
-            if restart_warp_service():
-                warp(["mode", "warp"], timeout=20)
-                time.sleep(1)
-            warp(["disconnect"], timeout=20)
-            time.sleep(2)
-            warp(["--accept-tos", "connect"], timeout=30)
-            for _ in range(18):
-                if op_stop.is_set():
-                    raise RuntimeError("用户取消了操作")
-                ok, out = warp(["status"], timeout=10)
-                last_out = out
-                with state_lock:
-                    state["warp_status"] = out.replace("\n", " ")
-                if "Connected" in out:
-                    connected = True
-                    break
-                time.sleep(2)
+        connected, last_out = connect_warp(update_phase=True)
         if not connected:
             raise RuntimeError(
                 "WARP 未能连接。最后状态: " + last_out[:160] +
@@ -369,16 +454,15 @@ def enable_split():
             )
         log("WARP 已连接")
 
-        # 4) 读取国内网段并并发注入排除列表
-        ranges = read_china_list()
+        ranges = read_active_ranges()
         if MAX_RANGES > 0:
             ranges = ranges[:MAX_RANGES]
         total = len(ranges)
         if total == 0:
-            raise RuntimeError("china_cidr.txt 为空，请点击『更新中国IP列表』")
-        log(f"准备注入 {total} 条中国 IP 规则 (并发 {WORKERS})")
+            raise RuntimeError("规则列表为空，请点击『更新中国IP列表』或导入规则")
+        log(f"准备注入 {total} 条分流规则 (并发 {WORKERS})")
         with state_lock:
-            state["progress"] = {"total": total, "done": 0, "phase": "注入中国IP分流规则..."}
+            state["progress"] = {"total": total, "done": 0, "phase": "注入分流规则..."}
 
         added = []
         done_cnt = 0
@@ -393,6 +477,13 @@ def enable_split():
                     return True
                 if "already" in out.lower():
                     return True
+                low = out.lower()
+                if any(k in low for k in ["not allowed", "not permitted", "policy",
+                                          "organization", "managed by", "team", "locked"]):
+                    with state_lock:
+                        state["zerotrust_locked"] = True
+                    log("检测到 Zero Trust 策略锁定 split-tunnel: " + out[:120], logging.ERROR)
+                    return False
                 time.sleep(0.3)
             return False
 
@@ -411,16 +502,14 @@ def enable_split():
             raise RuntimeError("用户取消了操作")
 
         with state_lock:
-            state["added_ranges"] = added
             state["enabled"] = True
             state["progress"] = {"total": total, "done": total, "phase": "分流已启用"}
         save_state()
-        log(f"分流启用完成: 成功注入 {len(added)}/{total} 条中国IP规则 (其余已存在或被跳过)")
+        log(f"分流启用完成: 成功注入 {len(added)}/{total} 条规则 (其余已存在或被跳过)")
     except Exception as e:
         log("启用失败: " + str(e), logging.ERROR)
         with state_lock:
             state["error"] = str(e)
-        # 自动回滚
         try:
             warp(["disconnect"], timeout=20)
             warp(["tunnel", "ip", "reset"], timeout=20)
@@ -448,7 +537,6 @@ def disable_split():
         warp(["disconnect"], timeout=20)
         with state_lock:
             state["enabled"] = False
-            state["added_ranges"] = []
             state["progress"] = {"total": 0, "done": 0, "phase": "已停用，网络恢复正常"}
         save_state()
         log("分流已停用，网络恢复正常")
@@ -466,7 +554,6 @@ def restore():
     """一键还原 (紧急): 终止正在进行的操作, 强制断开 + 重置, 回到干净状态。"""
     log("执行一键还原...")
     op_stop.set()
-    # 等待当前操作结束
     for _ in range(100):
         with state_lock:
             if not state["running"]:
@@ -480,8 +567,8 @@ def restore():
         pass
     with state_lock:
         state["enabled"] = False
-        state["added_ranges"] = []
         state["error"] = None
+        state["reconnecting"] = False
         state["progress"] = {"total": 0, "done": 0, "phase": "已还原 (干净状态)"}
     save_state()
     log("已执行一键还原，网络恢复默认")
@@ -533,6 +620,382 @@ def refresh_list():
             state["action"] = None
 
 
+# ====================== 规则列表管理 ======================
+def get_cli_excludes():
+    ok, out = warp(["tunnel", "ip", "list"], timeout=15)
+    res = set()
+    if not ok:
+        return res
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if "(CLI exclude)" in ln:
+            cidr = ln.split()[0].strip()
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+                res.add(cidr)
+            except Exception:
+                pass
+    return res
+
+
+def apply_diff_rules():
+    """后台自动更新: 重新拉取最新列表, 对 daemon 排除列表做增量 diff (新增/删除)。"""
+    try:
+        old = read_active_ranges()
+        refresh_list_data()
+        new = read_active_ranges()
+        current = get_cli_excludes()
+        desired = set(new)
+        to_add = desired - current
+        to_del = current - desired
+        if to_del:
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                list(ex.map(lambda c: warp(["tunnel", "ip", "remove-range", c], timeout=15), to_del))
+        if to_add:
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                list(ex.map(lambda c: warp(["tunnel", "ip", "add-range", c], timeout=15), to_add))
+        log(f"后台自动更新规则完成: 新增 {len(to_add)} 条, 移除 {len(to_del)} 条")
+    except Exception as e:
+        log("后台自动更新规则失败: " + str(e), logging.WARNING)
+
+
+def refresh_list_data():
+    """与 refresh_list 同逻辑但供后台线程调用 (不修改 state.running)。"""
+    try:
+        import urllib.request
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        data = urllib.request.urlopen(APNIC_URL, timeout=60, context=ctx).read().decode("utf-8", "ignore").splitlines()
+        cidrs = []
+        for ln in data:
+            p = ln.split("|")
+            if len(p) < 7:
+                continue
+            if p[1].upper() == "CN" and p[2] == "ipv4" and p[6] == "allocated":
+                try:
+                    ip = int(ipaddress.IPv4Address(p[3]))
+                    cnt = int(p[4])
+                except Exception:
+                    continue
+                for net in ipaddress.summarize_address_range(ipaddress.IPv4Address(ip), ipaddress.IPv4Address(ip + cnt - 1)):
+                    cidrs.append(net)
+        merged = list(ipaddress.collapse_addresses(cidrs))
+        out = [str(n) for n in merged]
+        with open(CHINA_LIST, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        return len(out)
+    except Exception as e:
+        log("刷新列表数据失败: " + str(e), logging.WARNING)
+        return 0
+
+
+def import_rule_list(name, source, value):
+    """导入自定义规则列表。source=url|text。返回 (ok, msg)。"""
+    if not name or "/" in name or "\\" in name:
+        return False, "名称非法 (不能含路径分隔符)"
+    os.makedirs(RULES_DIR, exist_ok=True)
+    lines = []
+    if source == "url":
+        try:
+            import urllib.request
+            ctx = ssl_create()
+            data = urllib.request.urlopen(value, timeout=30, context=ctx).read().decode("utf-8", "ignore").splitlines()
+            for ln in data:
+                ln = ln.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                try:
+                    ipaddress.ip_network(ln, strict=False)
+                    lines.append(ln)
+                except Exception:
+                    continue
+        except Exception as e:
+            return False, "下载失败: " + str(e)
+    else:
+        for ln in value.splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            try:
+                ipaddress.ip_network(ln, strict=False)
+                lines.append(ln)
+            except Exception:
+                continue
+    if not lines:
+        return False, "未解析到任何有效 CIDR 规则"
+    # 去重
+    seen = set(); uniq = []
+    for l in lines:
+        if l not in seen:
+            seen.add(l); uniq.append(l)
+    path = os.path.join(RULES_DIR, name + ".txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(uniq) + "\n")
+    rel = os.path.join("rules", name + ".txt").replace("\\", "/")
+    if rel not in settings["active_lists"]:
+        settings["active_lists"].append(rel)
+        save_settings()
+    return True, f"已导入 {len(uniq)} 条规则 -> rules/{name}.txt (已加入激活列表)"
+
+
+def delete_rule_list(name):
+    rel = name if name.startswith("rules/") else os.path.join("rules", name + ".txt").replace("\\", "/")
+    if rel == "china_cidr.txt" or name == "china_cidr.txt":
+        return False, "内置 china_cidr.txt 不可删除"
+    path = os.path.join(APP_DIR, rel)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        return False, str(e)
+    if rel in settings["active_lists"]:
+        settings["active_lists"].remove(rel)
+        save_settings()
+    return True, "已删除 " + rel
+
+
+def ssl_create():
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+# ====================== 后台守护线程 ======================
+def reconnect_loop():
+    while not EXIT_EVENT.is_set():
+        EXIT_EVENT.wait(15)
+        try:
+            if not settings.get("auto_reconnect", True):
+                continue
+            if not state["enabled"]:
+                continue
+            if state["running"]:
+                continue
+            ok, out = warp(["status"], timeout=10)
+            if "Connected" in out:
+                with state_lock:
+                    state["reconnecting"] = False
+                continue
+            log("检测到 WARP 断开, 自动重连中...", logging.WARNING)
+            with state_lock:
+                state["reconnecting"] = True
+            connected, last = connect_warp(max_attempts=3, update_phase=False)
+            with state_lock:
+                state["reconnecting"] = False
+            if connected:
+                log("WARP 已自动重连, 重新注入分流规则...")
+                # 重连后排除规则可能丢失, 重新注入
+                ranges = read_active_ranges()
+                if MAX_RANGES > 0:
+                    ranges = ranges[:MAX_RANGES]
+                for c in ranges:
+                    warp(["tunnel", "ip", "add-range", c], timeout=15)
+            else:
+                log("自动重连失败: " + last[:120], logging.ERROR)
+        except Exception as e:
+            log("reconnect loop err: " + str(e), logging.WARNING)
+
+
+def autoupdate_loop():
+    while not EXIT_EVENT.is_set():
+        EXIT_EVENT.wait(24 * 3600)
+        try:
+            if not settings.get("auto_update", False):
+                continue
+            if state["zerotrust_locked"]:
+                log("Zero Trust 锁定, 跳过自动更新", logging.WARNING)
+                continue
+            if state["running"]:
+                continue
+            if not state["enabled"]:
+                # 仅刷新列表文件, 不改动 daemon
+                n = refresh_list_data()
+                log(f"已静默刷新中国IP列表({n}条, 未启用故不注入)")
+                continue
+            apply_diff_rules()
+        except Exception as e:
+            log("autoupdate loop err: " + str(e), logging.WARNING)
+
+
+def ping_host(host, timeout_ms=1000):
+    """返回延迟(ms) 或 None。"""
+    try:
+        r = subprocess.run(["ping", "-n", "1", "-w", str(timeout_ms), host],
+                           capture_output=True, text=True, timeout=8, errors="ignore")
+        import re
+        m = re.search(r"(?:时间|time)[=<]\s*(\d+(?:\.\d+)?)\s*ms", r.stdout, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+# 延迟探测点池(均位于中国大陆 CIDR 列表内, 会走直连)
+CN_PROBES = [
+    ("36.152.44.96", 443), ("36.152.44.95", 443),
+    ("110.242.68.4", 443), ("110.242.68.3", 443),
+    ("182.61.200.7", 443), ("182.61.200.6", 443),
+]
+# 国际探测点(不在 CN 列表, 启用分流后走 WARP)
+INTL_PROBES = [("1.1.1.1", 443), ("1.0.0.1", 443), ("8.8.8.8", 443)]
+
+
+def probe_latency(probes, http_fallback=None, timeout=1.2):
+    """依次尝试 ICMP -> 各探测点 TCP 握手 -> HTTPS 兜底, 返回首个成功值(ms)。"""
+    # 1) ICMP(若本机放通则最准)
+    for ip, _ in probes:
+        v = ping_host(ip, timeout_ms=int(timeout * 1000))
+        if v:
+            return v
+    # 2) TCP 握手(多数网络下最可靠)
+    for ip, port in probes:
+        v = tcp_rtt(ip, port, timeout=timeout)
+        if v:
+            return v
+    # 3) HTTPS 往返兜底
+    if http_fallback:
+        v = http_rtt(http_fallback)
+        if v:
+            return v
+    return None
+
+
+def http_rtt(url, timeout=3.0):
+    """HTTPS GET 往返耗时(ms)。用于国内目标——多数国内IP不响应ICMP/裸TCP。"""
+    import urllib.request
+    import ssl
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener.addheaders = [("User-Agent", "Mozilla/5.0")]
+        t0 = time.time()
+        with opener.open(url, timeout=timeout, ) as resp:
+            resp.read(256)
+        return round((time.time() - t0) * 1000, 1)
+    except Exception:
+        return None
+
+
+def measure_speed(url, dur=4):
+    """下载 dur 秒, 返回 Mbps。绕过系统代理以测得真实吞吐。"""
+    import urllib.request
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        resp = opener.open(req, timeout=dur + 15)
+        start = time.time()
+        total = 0
+        while time.time() - start < dur:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+        elapsed = time.time() - start
+        if elapsed <= 0:
+            return None
+        return (total * 8) / (elapsed * 1_000_000)
+    except Exception:
+        return None
+
+
+def egress_loop():
+    """独立线程: 每 30s 刷新出口 IP, 避免拖慢延迟采样循环。"""
+    while not EXIT_EVENT.is_set():
+        EXIT_EVENT.wait(30)
+        try:
+            ip = get_egress_ip()
+            with metrics_lock:
+                metrics["egress_ip"] = ip
+        except Exception:
+            pass
+
+
+def metrics_loop():
+    intl_url = "https://www.cloudflare.com/cdn-cgi/trace"
+    while not EXIT_EVENT.is_set():
+        EXIT_EVENT.wait(3)
+        try:
+            lat_cn = probe_latency(CN_PROBES)
+            lat_intl = probe_latency(INTL_PROBES, http_fallback=intl_url)
+            with metrics_lock:
+                metrics["latency_cn"] = lat_cn
+                metrics["latency_intl"] = lat_intl
+                # 速率每 ~30s 测一次
+                if settings.get("metrics_speed", True) and (time.time() - metrics["last_speed_ts"] >= 30):
+                    spd = measure_speed(SPEED_TEST_URL, dur=4)
+                    if spd is not None:
+                        metrics["dl_speed_mbps"] = round(spd, 1)
+                    metrics["last_speed_ts"] = time.time()
+                spd = metrics.get("dl_speed_mbps")
+                metrics_history.append({
+                    "t": int(time.time()),
+                    "cn": lat_cn, "intl": lat_intl,
+                    "spd": spd,
+                })
+                if len(metrics_history) > 60:
+                    metrics_history.pop(0)
+        except Exception as e:
+            log("metrics err: " + str(e), logging.DEBUG)
+
+
+# ====================== 开机自启 (计划任务) ======================
+def autostart_enabled():
+    try:
+        r = subprocess.run(["schtasks", "/query", "/tn", AUTOSTART_TASK, "/fo", "LIST"],
+                           capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def register_autostart():
+    py = sys.executable
+    script = os.path.abspath(__file__)
+    # /tr 用列表传入, 避免 shell 引号问题
+    tr = '"%s" "%s" --tray' % (py, script)
+    r = subprocess.run(
+        ["schtasks", "/create", "/tn", AUTOSTART_TASK, "/tr", tr,
+         "/sc", "onlogon", "/rl", "highest", "/f"],
+        capture_output=True, text=True, timeout=30)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def unregister_autostart():
+    r = subprocess.run(["schtasks", "/delete", "/tn", AUTOSTART_TASK, "/f"],
+                       capture_output=True, text=True, timeout=30)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+# ====================== Zero Trust 检测 ======================
+def detect_zerotrust():
+    """判定是否为 Zero Trust(团队版) 且策略锁定分流。
+    依据: warp-cli settings 中的 Switch Locked / Organization / 组织策略来源。"""
+    _, so = warp(["settings"], timeout=10)
+    low = so.lower()
+    locked = False
+    if "organization" in low or "managed by" in low:
+        locked = True
+    # 仅当组织策略显式锁定开关时才判定为受限
+    m = re.search(r"switch locked:\s*(\w+)", low)
+    if m and m.group(1) == "true":
+        locked = True
+    if locked:
+        with state_lock:
+            state["zerotrust_locked"] = True
+    # 摘要: 只回传与判定相关的行, 避免把整份配置暴露给前端
+    keep = [ln.strip() for ln in so.splitlines()
+            if ("switch locked" in ln.lower() or "organization" in ln.lower()
+                or "mode:" in ln.lower() or "compliance" in ln.lower())]
+    return {"locked": bool(locked), "raw": "\n".join(keep)[:400] or so[:200]}
+
+
 # ====================== 状态查询 ======================
 def get_status():
     ok, out = warp(["status"], timeout=10)
@@ -549,25 +1012,290 @@ def get_status():
     cli_count = listout.count("(CLI exclude)")
     egress = get_egress_ip()
     with state_lock:
-        # 启用完成后即使 daemon 状态短暂显示 Connecting，也视为已连接(分流已生效)
         if state["enabled"] and not connected and "Disconnected" not in out and "Failure" not in out:
             connected = True
+        # 在线时长
+        if connected:
+            if metrics["connected_since"] is None:
+                metrics["connected_since"] = time.time()
+        else:
+            metrics["connected_since"] = None
+        uptime = int(time.time() - metrics["connected_since"]) if metrics["connected_since"] else 0
+
         st = {
             "warp_status": out.strip(),
             "connected": connected,
             "mode": mode,
             "cli_exclude_count": cli_count,
-            "list_total": len(read_china_list()),
+            "list_total": len(read_active_ranges()),
             "egress_ip": egress,
             "enabled": state["enabled"],
             "running": state["running"],
             "action": state["action"],
+            "reconnecting": state["reconnecting"],
+            "zerotrust_locked": state["zerotrust_locked"],
             "progress": dict(state["progress"]),
             "error": state["error"],
             "warp_cli": find_warp_cli() or "",
             "max_ranges_test": MAX_RANGES,
+            "auto_reconnect": settings.get("auto_reconnect", True),
+            "auto_update": settings.get("auto_update", False),
+            "metrics_speed": settings.get("metrics_speed", True),
+            "tray": settings.get("tray", True),
+            "theme": settings.get("theme", "dark"),
+            "active_lists": list(settings.get("active_lists", ["china_cidr.txt"])),
+            "latency_cn": metrics["latency_cn"],
+            "latency_intl": metrics["latency_intl"],
+            "dl_speed_mbps": metrics["dl_speed_mbps"],
+            "uptime_s": uptime,
         }
     return st
+
+
+# ====================== 系统托盘 (ctypes, 零依赖) ======================
+def make_hicon(rgb):
+    """用 ctypes 生成一个纯色圆形 HICON。失败返回 0。"""
+    try:
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        kernel32 = ctypes.windll.kernel32
+        hinst = kernel32.GetModuleHandleW(None)
+        w = h = 32
+        buf = bytearray(w * h * 4)
+        cx = cy = w / 2.0
+        rad = w / 2.0 - 2
+        for y in range(h):
+            for x in range(w):
+                dx = x - cx + 0.5
+                dy = cy - y - 0.5
+                ins = (dx * dx + dy * dy) <= rad * rad
+                off = (y * w + x) * 4
+                if ins:
+                    buf[off] = rgb[2]
+                    buf[off + 1] = rgb[1]
+                    buf[off + 2] = rgb[0]
+                    buf[off + 3] = 255
+                else:
+                    buf[off + 3] = 0
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", ctypes.c_ulong), ("biWidth", ctypes.c_long),
+                        ("biHeight", ctypes.c_long), ("biPlanes", ctypes.c_ushort),
+                        ("biBitCount", ctypes.c_ushort), ("biCompression", ctypes.c_ulong),
+                        ("biSizeImage", ctypes.c_ulong), ("biXPelsPerMeter", ctypes.c_long),
+                        ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", ctypes.c_ulong),
+                        ("biClrImportant", ctypes.c_ulong)]
+
+        class BITMAPINFO(ctypes.Structure):
+            _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", ctypes.c_ulong * 1)]
+
+        class ICONINFO(ctypes.Structure):
+            _fields_ = [("fIcon", ctypes.c_bool), ("xHotspot", ctypes.c_ulong),
+                        ("yHotspot", ctypes.c_ulong), ("hbmMask", ctypes.c_void_p),
+                        ("hbmColor", ctypes.c_void_p)]
+
+        hdc = user32.GetDC(0)
+        hbmColor = gdi32.CreateCompatibleBitmap(hdc, w, h)
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        gdi32.SetDIBits(hdc, hbmColor, 0, h, ctypes.cast(ctypes.create_string_buffer(bytes(buf)), ctypes.c_void_p),
+                        ctypes.byref(bmi), 0)
+        # 掩码: 单色全 0 = 完全不透明
+        mask_bytes = ((w + 15) // 16) * 2 * h
+        hbmMask = gdi32.CreateBitmap(w, h, 1, 1, ctypes.create_string_buffer(mask_bytes))
+        ii = ICONINFO()
+        ii.fIcon = True
+        ii.hbmMask = hbmMask
+        ii.hbmColor = hbmColor
+        hicon = user32.CreateIconIndirect(ctypes.byref(ii))
+        gdi32.DeleteObject(hbmColor)
+        gdi32.DeleteObject(hbmMask)
+        user32.ReleaseDC(0, hdc)
+        return hicon
+    except Exception:
+        return 0
+
+
+class TrayApp:
+    WM_SHELL = 0x400 + 1  # WM_USER + 1
+    MSG_OPEN, MSG_ENABLE, MSG_DISABLE, MSG_FIX, MSG_EXIT = 1, 2, 3, 4, 5
+
+    def __init__(self, url):
+        self.url = url
+        self.hwnd = 0
+        self.hicon = 0
+        self.hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
+        self.wndclass = None
+        self.wndproc = None
+
+    def create(self):
+        user32 = ctypes.windll.user32
+        WM_DESTROY = 2
+        WM_COMMAND = 0x0111
+
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p)
+
+        def wndproc(hwnd, msg, wparam, lparam):
+            if msg == self.WM_SHELL:
+                event = lparam & 0xFFFF
+                if event == 0x0203:  # WM_LBUTTONDBLCLK
+                    self._open()
+                elif event == 0x0205:  # WM_RBUTTONUP
+                    self._show_menu()
+                return 0
+            if msg == WM_COMMAND:
+                cmd = wparam & 0xFFFF
+                self._menu(cmd)
+                return 0
+            if msg == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self.wndproc = WNDPROC(wndproc)
+        className = "WarpSplitTray"
+        self.wndclass = ctypes.create_unicode_buffer(className)
+
+        class WNDCLASS(ctypes.Structure):
+            _fields_ = [("style", ctypes.c_uint), ("lpfnWndProc", WNDPROC),
+                        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                        ("hInstance", ctypes.c_void_p), ("hIcon", ctypes.c_void_p),
+                        ("hCursor", ctypes.c_void_p), ("hbrBackground", ctypes.c_void_p),
+                        ("lpszMenuName", ctypes.c_wchar_p), ("lpszClassName", ctypes.c_wchar_p)]
+
+        wc = WNDCLASS()
+        wc.style = 0
+        wc.lpfnWndProc = self.wndproc
+        wc.hInstance = self.hinst
+        wc.lpszClassName = self.wndclass
+        if not user32.RegisterClassW(ctypes.byref(wc)):
+            return False
+        self.hwnd = user32.CreateWindowExW(0, self.wndclass, "WARP", 0, 0, 0, 0, 0,
+                                           0, 0, self.hinst, 0)
+        if not self.hwnd:
+            return False
+        self._register_icon()
+        return True
+
+    def _register_icon(self):
+        user32 = ctypes.windll.user32
+        self.hicon = make_hicon((34, 197, 94))
+        if not self.hicon:
+            self.hicon = user32.LoadIconW(0, 32516)  # IDI_INFORMATION 兜底
+
+        class NOTIFYICONDATA(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_ulong), ("hWnd", ctypes.c_void_p),
+                        ("uID", ctypes.c_uint), ("uFlags", ctypes.c_ulong),
+                        ("uCallbackMessage", ctypes.c_ulong), ("hIcon", ctypes.c_void_p),
+                        ("szTip", ctypes.c_wchar * 128)]
+
+        nid = NOTIFYICONDATA()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
+        nid.hWnd = self.hwnd
+        nid.uID = 1
+        nid.uFlags = 0x7  # NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uCallbackMessage = self.WM_SHELL
+        nid.hIcon = self.hicon
+        tip = "Cloudflare WARP 智能分流 (未启用)"
+        ctypes.memmove(ctypes.addressof(nid.szTip), ctypes.create_unicode_buffer(tip), len(tip) * 2)
+        user32.Shell_NotifyIconW(0x0, ctypes.byref(nid))  # NIM_ADD
+
+    def update(self, connected, enabled):
+        if not self.hwnd:
+            return
+        user32 = ctypes.windll.user32
+        if self.hicon:
+            user32.DestroyIcon(self.hicon)
+        color = (34, 197, 94) if (enabled and connected) else ((245, 158, 11) if state.get("running") else (239, 68, 68))
+        self.hicon = make_hicon(color) or user32.LoadIconW(0, 32516)
+
+        class NOTIFYICONDATA(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_ulong), ("hWnd", ctypes.c_void_p),
+                        ("uID", ctypes.c_uint), ("uFlags", ctypes.c_ulong),
+                        ("uCallbackMessage", ctypes.c_ulong), ("hIcon", ctypes.c_void_p),
+                        ("szTip", ctypes.c_wchar * 128)]
+
+        nid = NOTIFYICONDATA()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
+        nid.hWnd = self.hwnd
+        nid.uID = 1
+        nid.uFlags = 0x7
+        nid.uCallbackMessage = self.WM_SHELL
+        nid.hIcon = self.hicon
+        tip = "Cloudflare WARP 智能分流"
+        if state.get("running"):
+            tip = "Cloudflare WARP 智能分流 (操作中...)"
+        elif enabled and connected:
+            tip = "Cloudflare WARP 智能分流 (分流中)"
+        elif enabled:
+            tip = "Cloudflare WARP 智能分流 (已启用/重连中)"
+        else:
+            tip = "Cloudflare WARP 智能分流 (未启用)"
+        ctypes.memmove(ctypes.addressof(nid.szTip), ctypes.create_unicode_buffer(tip), len(tip) * 2)
+        user32.Shell_NotifyIconW(0x1, ctypes.byref(nid))  # NIM_MODIFY
+
+    def _open(self):
+        try:
+            webbrowser.open(self.url)
+        except Exception:
+            pass
+
+    def _show_menu(self):
+        user32 = ctypes.windll.user32
+        menu = user32.CreatePopupMenu()
+        user32.AppendMenuW(menu, 0, self.MSG_OPEN, "打开控制台")
+        user32.AppendMenuW(menu, 0, self.MSG_ENABLE, "启用分流")
+        user32.AppendMenuW(menu, 0, self.MSG_DISABLE, "停用分流")
+        user32.AppendMenuW(menu, 0, self.MSG_FIX, "修复 IPv6")
+        user32.AppendMenuW(menu, 0, self.MSG_EXIT, "退出")
+        pos = ctypes.wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pos))
+        user32.SetForegroundWindow(self.hwnd)
+        user32.TrackPopupMenu(menu, 0, pos.x, pos.y, 0, self.hwnd, 0)
+        user32.DestroyMenu(menu)
+
+    def _menu(self, cmd):
+        if cmd == self.MSG_OPEN:
+            self._open()
+        elif cmd == self.MSG_ENABLE:
+            if not state["enabled"]:
+                threading.Thread(target=enable_split, daemon=True).start()
+        elif cmd == self.MSG_DISABLE:
+            if state["enabled"]:
+                threading.Thread(target=disable_split, daemon=True).start()
+        elif cmd == self.MSG_FIX:
+            fix_ipv6()
+        elif cmd == self.MSG_EXIT:
+            self.quit()
+
+    def quit(self):
+        try:
+            ctypes.windll.user32.Shell_NotifyIconW(0x2, ctypes.byref(ctypes.create_string_buffer(0)))  # best-effort remove
+        except Exception:
+            pass
+        EXIT_EVENT.set()
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        os._exit(0)
+
+    def run(self):
+        if not self.create():
+            log("托盘图标初始化失败 (可忽略, Web 控制台仍可用)", logging.WARNING)
+            return
+        user32 = ctypes.windll.user32
+        msg = ctypes.wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        # 退出
+        EXIT_EVENT.set()
 
 
 # ====================== Web 服务 ======================
@@ -579,8 +1307,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _json(self, obj):
+        self._send(200, json.dumps(obj, ensure_ascii=False))
 
     def do_GET(self):
         p = urlparse(self.path).path
@@ -591,21 +1323,47 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
         elif p == "/api/ping":
-            self._send(200, json.dumps({"ok": True, "port": PORT}))
+            self._json({"ok": True, "port": PORT})
         elif p == "/api/status":
             try:
-                self._send(200, json.dumps(get_status(), ensure_ascii=False))
+                self._json(get_status())
             except Exception as e:
-                self._send(200, json.dumps({"error": str(e)}, ensure_ascii=False))
+                self._json({"error": str(e)})
         elif p == "/api/log":
             with log_lock:
                 lines = list(log_lines)
-            self._send(200, json.dumps({"log": lines}, ensure_ascii=False))
+            self._json({"log": lines})
         elif p == "/api/selftest":
             try:
-                self._send(200, json.dumps(self_test(), ensure_ascii=False))
+                self._json(self_test())
             except Exception as e:
-                self._send(200, json.dumps({"verdict": "ERROR", "msg": str(e)}, ensure_ascii=False))
+                self._json({"verdict": "ERROR", "msg": str(e)})
+        elif p == "/api/metrics":
+            with metrics_lock:
+                self._json({
+                    "latency_cn": metrics["latency_cn"],
+                    "latency_intl": metrics["latency_intl"],
+                    "dl_speed_mbps": metrics["dl_speed_mbps"],
+                    "egress_ip": metrics["egress_ip"],
+                    "uptime_s": metrics["uptime_s"],
+                    "history": list(metrics_history),
+                })
+        elif p == "/api/rules":
+            avail = []
+            for name in settings.get("active_lists", []):
+                avail.append({"name": name, "active": True, "count": len(read_list_file(os.path.join(APP_DIR, name)))})
+            if os.path.isdir(RULES_DIR):
+                for fn in os.listdir(RULES_DIR):
+                    if fn.endswith(".txt"):
+                        rel = "rules/" + fn
+                        if rel not in settings["active_lists"]:
+                            avail.append({"name": rel, "active": False,
+                                          "count": len(read_list_file(os.path.join(RULES_DIR, fn)))})
+            self._json({"lists": avail})
+        elif p == "/api/zerotrust":
+            self._json(detect_zerotrust())
+        elif p == "/api/autostart":
+            self._json({"enabled": autostart_enabled()})
         elif p == "/favicon.ico":
             self._send(204, b"")
         else:
@@ -613,26 +1371,64 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urlparse(self.path).path
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            payload = {}
+
         if p == "/api/enable":
             threading.Thread(target=enable_split, daemon=True).start()
-            self._send(200, json.dumps({"ok": True, "msg": "已开始启用分流"}))
+            self._json({"ok": True, "msg": "已开始启用分流"})
         elif p == "/api/disable":
             threading.Thread(target=disable_split, daemon=True).start()
-            self._send(200, json.dumps({"ok": True}))
+            self._json({"ok": True})
         elif p == "/api/restore":
             threading.Thread(target=restore, daemon=True).start()
-            self._send(200, json.dumps({"ok": True}))
+            self._json({"ok": True})
         elif p == "/api/refresh":
             threading.Thread(target=refresh_list, daemon=True).start()
-            self._send(200, json.dumps({"ok": True}))
+            self._json({"ok": True})
         elif p == "/api/fix_ipv6":
             ok, out = fix_ipv6()
-            self._send(200, json.dumps({"ok": ok, "msg": out}, ensure_ascii=False))
+            self._json({"ok": ok, "msg": out})
+        elif p == "/api/settings":
+            for k in ("theme", "auto_reconnect", "auto_update", "metrics_speed", "tray"):
+                if k in payload:
+                    settings[k] = payload[k]
+            save_settings()
+            self._json({"ok": True, "settings": settings})
+        elif p == "/api/autostart/enable":
+            ok, out = register_autostart()
+            self._json({"ok": ok, "msg": out})
+        elif p == "/api/autostart/disable":
+            ok, out = unregister_autostart()
+            self._json({"ok": ok, "msg": out})
+        elif p == "/api/rules/import":
+            ok, out = import_rule_list(payload.get("name", ""), payload.get("source", "text"), payload.get("value", ""))
+            self._json({"ok": ok, "msg": out})
+        elif p == "/api/rules/delete":
+            ok, out = delete_rule_list(payload.get("name", ""))
+            self._json({"ok": ok, "msg": out})
+        elif p == "/api/rules/toggle":
+            name = payload.get("name", "")
+            active = payload.get("active", True)
+            if name:
+                if active and name not in settings["active_lists"]:
+                    settings["active_lists"].append(name)
+                elif not active and name in settings["active_lists"]:
+                    settings["active_lists"].remove(name)
+                save_settings()
+            self._json({"ok": True})
         else:
             self._send(404, json.dumps({"error": "not found"}, ensure_ascii=False))
 
     def log_message(self, *a):
         pass
+
+
+server = None
 
 
 # ====================== 提权 ======================
@@ -653,16 +1449,26 @@ def run_as_admin():
 
 # ====================== 主函数 ======================
 def main():
+    global server
+    load_settings()
     load_state()
     if not is_admin():
         log("当前非管理员, 尝试提权...")
         run_as_admin()
         sys.exit(0)
 
+    tray_mode = settings.get("tray", True) and "--no-tray" not in sys.argv
+
     log("Cloudflare WARP 智能分流控制台 启动")
     log(f"监听 http://127.0.0.1:{PORT}/  (工作目录: {APP_DIR})")
     if MAX_RANGES > 0:
         log(f"[测试模式] 仅注入前 {MAX_RANGES} 条规则")
+
+    # 启动后台守护线程
+    threading.Thread(target=metrics_loop, daemon=True).start()
+    threading.Thread(target=reconnect_loop, daemon=True).start()
+    threading.Thread(target=autoupdate_loop, daemon=True).start()
+    threading.Thread(target=egress_loop, daemon=True).start()
 
     try:
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
@@ -670,11 +1476,33 @@ def main():
         log(f"无法在端口 {PORT} 启动服务: {e}（可能已有实例在运行，端口被占用）", logging.ERROR)
         input("按回车退出...")
         sys.exit(1)
+
+    # 托盘 (独立线程, 失败不影响 Web 服务)
+    tray = None
+    if tray_mode:
+        tray = TrayApp(f"http://127.0.0.1:{PORT}/")
+        threading.Thread(target=tray.run, daemon=True).start()
+
+    # 周期性更新托盘图标
+    def tray_updater():
+        while not EXIT_EVENT.is_set():
+            EXIT_EVENT.wait(5)
+            if tray and tray.hwnd:
+                try:
+                    st = get_status()
+                    tray.update(st.get("connected", False), st.get("enabled", False))
+                except Exception:
+                    pass
+
+    if tray:
+        threading.Thread(target=tray_updater, daemon=True).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         log("收到退出信号")
     finally:
+        EXIT_EVENT.set()
         server.shutdown()
         save_state()
 
