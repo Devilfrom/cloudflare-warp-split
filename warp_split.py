@@ -2630,6 +2630,51 @@ def reconnect_loop():
             log("reconnect loop err: " + str(e), logging.WARNING)
 
 
+def cleanup_dns_residue_on_startup():
+    """清理「上次进程被硬杀」留下的智能 DNS 残留。
+
+    atexit 挡不住 taskkill -f / 崩溃 / 断电。残留的完整链条(实测踩过):
+      1. 智能 DNS 接管时把网卡静态 DNS 写成 127.0.0.1;
+      2. 进程被硬杀, 网卡 DNS 和 daemon 学到的 fallback(127.0.0.1:53)
+         都来不及还原;
+      3. WARP 仍连着(Always On), 本机 53 端口却已无人监听 -> daemon 把
+         所有 DNS 查询转发到死地址, 实测 182 条查询 100% Other Error;
+      4. 浏览器靠缓存苟活(页面能开、上传能跑), 但任何新建连接都要新解析
+         —— 表现为测速网站「下载 0.00 Mbps」, 且越用越卡。
+
+    注意 WARP 连着时网卡显示值永远是 127.0.2.2/.3(daemon 自己覆写的),
+    所以判定要看两处: 注册表静态 NameServer, 以及 daemon 的 fallback。
+    用户若自己在 127.0.0.1:53 跑了别的 DNS(端口在听), fallback 那条
+    判定不成立, 不会误伤。
+    """
+    if not _IS_WIN:
+        return
+    try:
+        stale_nic = _static_dns_left()
+        stale_fb = False
+        if not stale_nic:
+            fb = dns_fallback_server()
+            stale_fb = "127.0.0.1" in fb and not port_in_use(53, "127.0.0.1")
+        if not (stale_nic or stale_fb):
+            return
+        if _DNS_SERVER is not None or state.get("dns_proxy"):
+            return  # 智能 DNS 已由本进程接管, 不是残留
+        log("检测到上次异常退出留下的 DNS 残留(网卡静态 DNS 或 WARP fallback "
+            "仍指向 127.0.0.1:53), 正在还原...", logging.WARNING)
+        apply_nic_dns([])
+        ok, out = warp(["status"], timeout=15)
+        if "Connected" in (out or ""):
+            # daemon 的 fallback 只在 connect 时重新从网卡学习, 必须重连一次
+            warp(["disconnect"], timeout=15)
+            time.sleep(1.5)
+            connect_warp(max_attempts=3, update_phase=False)
+            log("已还原网卡 DNS 并重连 WARP (fallback 重新学习为路由器/DHCP)")
+        else:
+            log("已还原网卡 DNS (WARP 当前未连接, 下次连接会自动学习新 fallback)")
+    except Exception as e:
+        log("DNS 残留清理失败: " + str(e), logging.WARNING)
+
+
 def reconcile_state_on_startup():
     """启动后校对「上次留下的 enabled 标志」与「daemon 的真实状态」。
 
@@ -2644,6 +2689,9 @@ def reconcile_state_on_startup():
         『启动时自动恢复』才会自动执行。
     """
     time.sleep(6)
+    # 先清残留再谈恢复: 硬杀留下的 127.0.0.1 残留不清掉, 后面所有
+    # 判定与自愈都会在一个「DNS 全挂」的地基上空转。
+    cleanup_dns_residue_on_startup()
     try:
         ok, out = warp(["status"], timeout=15)
         connected = "Connected" in out
