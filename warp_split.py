@@ -23,6 +23,7 @@ import re
 import json
 import time
 import struct
+import shutil
 import threading
 import subprocess
 import logging
@@ -35,7 +36,58 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
 # ====================== 配置 ======================
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# PyInstaller 打包后 __file__ 指向临时解压目录(_MEIxxx), 会在进程退出后被删除。
+# 因此区分两个目录:
+#   RES_DIR  - 只读资源目录(内置的 index.html / china_cidr.txt 初始副本)
+#   APP_DIR  - 可写数据目录(china_cidr.txt / settings.json / state.json / 日志)
+#             打包后取 exe 所在目录, 保证配置能持久化。
+IS_FROZEN = getattr(sys, "frozen", False)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+if IS_FROZEN:
+    RES_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    RES_DIR = _SCRIPT_DIR
+    APP_DIR = _SCRIPT_DIR
+
+
+def asset_path(name):
+    """定位随程序分发的资源文件。
+
+    优先使用 APP_DIR(data 目录/exe 同级目录)下的版本，便于用户直接修改；
+    若不存在则回退到打包内置的 RES_DIR 版本。
+    """
+    p = os.path.join(APP_DIR, name)
+    if os.path.isfile(p):
+        return p
+    return os.path.join(RES_DIR, name)
+
+
+def pause(msg="按回车退出..."):
+    """打包为窗口模式(--windowed)时没有控制台，input() 会抛异常。"""
+    try:
+        if sys.stdin is None or sys.stdin.closed or not sys.stdin.isatty():
+            return
+        input(msg)
+    except Exception:
+        pass
+
+
+def ensure_data_files():
+    """打包模式下，把内置资源首次复制到 exe 同级目录，保证可持久化。"""
+    if not IS_FROZEN:
+        return
+    for name in ("index.html", "china_cidr.txt"):
+        dst = os.path.join(APP_DIR, name)
+        src = os.path.join(RES_DIR, name)
+        if not os.path.isfile(dst) and os.path.isfile(src):
+            try:
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
+
+
 WARP_CLI_CANDIDATES = [
     r"C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe",
     r"C:\Program Files (x86)\Cloudflare\Cloudflare WARP\warp-cli.exe",
@@ -1444,7 +1496,7 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path).path
         if p in ("/", "/index.html"):
             try:
-                data = open(os.path.join(APP_DIR, "index.html"), "rb").read()
+                data = open(asset_path("index.html"), "rb").read()
                 self._send(200, data, "text/html; charset=utf-8")
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
@@ -1576,6 +1628,7 @@ def run_as_admin():
 # ====================== 主函数 ======================
 def main():
     global server
+    ensure_data_files()
     load_settings()
     load_state()
     if not is_admin():
@@ -1600,7 +1653,7 @@ def main():
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     except OSError as e:
         log(f"无法在端口 {PORT} 启动服务: {e}（可能已有实例在运行，端口被占用）", logging.ERROR)
-        input("按回车退出...")
+        pause()
         sys.exit(1)
 
     # 托盘 (独立线程, 失败不影响 Web 服务)

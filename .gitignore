@@ -11,3 +11,13 @@ Thumbs.db
 # 本机个人配置与自定义规则列表（因人而异，勿提交）
 settings.json
 rules/
+
+# 构建产物
+build/
+*.exe
+
+# 安装包/安卓包：体积大且可从官方渠道获取，改放 GitHub Release，不进 git 历史
+dist/
+*.apk
+*.apkm
+*.msi
