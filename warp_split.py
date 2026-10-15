@@ -525,16 +525,35 @@ def read_china_list():
     return read_list_file(CHINA_LIST)
 
 
-def read_active_ranges():
+_RANGES_CACHE = {"key": None, "val": []}
+
+
+def read_active_ranges(force=False):
     """读取所有"激活"的规则列表 (默认 china_cidr.txt + 自定义导入列表)。
 
     返回的最前面总是 ALWAYS_DIRECT(私有网段等必须直连的保留地址),
     因此本函数的返回值 = 期望被 daemon 排除的完整网段集合。
+
+    为什么要缓存: 控制台每 1.5 秒轮询一次 /api/status, 而它要显示规则总数。
+    不缓存的话每 1.5 秒就要把 5440 行重新读一遍、解析一遍再去重 —— 纯浪费。
+    缓存 key 取「激活列表名 + 每个文件的 mtime/size」, 所以列表换了、文件更新了
+    (点『更新中国IP列表』) 都会自动失效, 不需要手动清理。
     """
+    names = [n for n in settings.get("active_lists", ["china_cidr.txt"]) if n]
+    key_parts = []
+    for name in names:
+        p = name if os.path.isabs(name) else os.path.join(APP_DIR, name)
+        try:
+            st = os.stat(p)
+            key_parts.append((name, int(st.st_mtime), st.st_size))
+        except OSError:
+            key_parts.append((name, 0, 0))
+    key = tuple(key_parts)
+    if not force and _RANGES_CACHE["key"] == key and _RANGES_CACHE["val"]:
+        return _RANGES_CACHE["val"]
+
     ranges = list(ALWAYS_DIRECT)
-    for name in settings.get("active_lists", ["china_cidr.txt"]):
-        if not name:
-            continue
+    for name in names:
         p = name if os.path.isabs(name) else os.path.join(APP_DIR, name)
         if os.path.exists(p):
             ranges += read_list_file(p)
@@ -545,6 +564,8 @@ def read_active_ranges():
         if r not in seen:
             seen.add(r)
             uniq.append(r)
+    _RANGES_CACHE["key"] = key
+    _RANGES_CACHE["val"] = uniq
     return uniq
 
 
@@ -2105,8 +2126,11 @@ def net_ok(timeout=2.5):
     return False, "解析 %s 均失败" % " / ".join(NET_PROBES)
 
 
-def rescue_network(reason=""):
+def rescue_network(reason="", force=False):
     """网络急救: 逐级退让, 每一步之后复查, 通了就停。返回 (ok, detail)。
+
+    force=True 表示用户手动触发(按钮/托盘), 无视冷却强制执行。
+    自动触发时遵守 5 分钟跨进程冷却 —— 见下面那段说明。
 
     退让顺序按「代价从小到大、可能性从高到低」排:
       L0 还原网卡 DNS(清掉 127.0.0.1 残留) + 撤掉 WARP fallback 后缀
@@ -2119,6 +2143,15 @@ def rescue_network(reason=""):
     ok, detail = net_ok()
     if ok:
         return True, "网络正常 (%s)" % detail
+    # 跨进程冷却: 计划任务拉起的 --guard 每次都是全新进程, 内存里的冷却变量
+    # 每次都归零 —— 网络真的断着的时候它会每 5 分钟做一遍全套退让(含断开
+    # WARP), 把 state.json 反复改。所以冷却判据放在持久化的 state 里,
+    # 主进程和巡检进程都遵守。手动触发(force)不受此限。
+    last = state.get("rescue") or {}
+    if not force and last.get("ts") and time.time() - last["ts"] < 300:
+        return False, ("5 分钟内已急救过一次(上次结果: %s), 本次跳过 —— "
+                       "反复拆网络只会让情况更乱" % (last.get("detail") or "未知"))
+
     log("网络不可用(%s)%s, 开始急救..." % (detail, (" 触发原因: " + reason) if reason else ""),
         logging.WARNING)
     # 一旦进入退让就上两个冷却, 防止几个守护线程互相拆台、来回震荡:
@@ -2277,9 +2310,10 @@ def net_guard_loop():
 
 
 def watchdog_enabled():
-    """系统级兜底计划任务是否已注册。缓存 60 秒, 别每次 /api/status 都跑 schtasks。"""
+    """系统级兜底计划任务是否已注册。缓存 5 分钟, 别每次 /api/status 都跑 schtasks
+    (它每 1.5 秒被轮询一次, 而起一个子进程去问计划任务是纯浪费)。"""
     now = time.time()
-    if now - _WD_CACHE["ts"] < 60:
+    if now - _WD_CACHE["ts"] < 300:
         return _WD_CACHE["val"]
     _WD_CACHE["ts"] = now
     if not _IS_WIN:
@@ -2339,11 +2373,13 @@ def run_guard_once():
     """一次性网络兜底(计划任务每 5 分钟调一次, 无界面、不启服务)。
 
     只做一件事: 上不了网就按分级退让救回来。正常情况一轮解析就返回, 耗时毫秒级。
+
+    正常时故意不写日志: 它每 5 分钟被系统拉起一次, 一天 288 次, 全写进去
+    日志里就全是"网络正常", 真正有用的异常行反而被淹没了。
     """
     try:
         ok, detail = net_ok()
         if ok:
-            log("[guard] 网络正常 (%s)" % detail)
             return 0
         log("[guard] 检测到网络不可用 (%s), 开始急救" % detail, logging.WARNING)
         ok2, msg2 = rescue_network("计划任务巡检")
@@ -2635,6 +2671,7 @@ def refresh_list():
         out = [str(n) for n in merged]
         with open(CHINA_LIST, "w", encoding="utf-8") as f:
             f.write("\n".join(out) + "\n")
+        read_active_ranges(force=True)   # 文件刚重写, 强制刷新缓存
         log(f"中国IP列表已更新: 共 {len(out)} 条")
         with state_lock:
             state["progress"] = {"total": 0, "done": 0, "phase": f"列表已更新({len(out)}条)"}
@@ -3796,7 +3833,7 @@ class TrayApp:
             fix_ipv6()
         elif cmd == self.MSG_RESCUE:
             def _r():
-                ok, msg = rescue_network("托盘菜单手动触发")
+                ok, msg = rescue_network("托盘菜单手动触发", force=True)
                 log("网络急救: " + msg, logging.INFO if ok else logging.ERROR)
             threading.Thread(target=_r, daemon=True).start()
         elif cmd == self.MSG_EXIT:
@@ -3937,7 +3974,7 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/rescue":
             # 手动「网络急救」。放后台线程: 分级退让最多要几十秒。
             def _rescue():
-                ok, msg = rescue_network("用户手动触发")
+                ok, msg = rescue_network("用户手动触发", force=True)
                 log("手动网络急救: " + msg, logging.INFO if ok else logging.ERROR)
             threading.Thread(target=_rescue, daemon=True).start()
             self._json({"ok": True, "msg": "已开始网络急救"})
