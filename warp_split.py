@@ -3321,6 +3321,13 @@ def metrics_loop():
             with metrics_lock:
                 metrics["latency_cn"] = lat_cn
                 metrics["latency_intl"] = lat_intl
+                # 在线时长: 只在 metrics_loop 里更新过一次就忘了 —— 之前
+                # metrics["uptime_s"] 永远是 0, 面板上「在线时长」一直显示
+                # 「—」。这里按当前 WARP 连接状态实时推算。
+                if metrics["connected_since"]:
+                    metrics["uptime_s"] = int(time.time() - metrics["connected_since"])
+                else:
+                    metrics["uptime_s"] = 0
                 # 速率每 ~30s 测一次
                 if settings.get("metrics_speed", True) and (time.time() - metrics["last_speed_ts"] >= 30):
                     spd = measure_speed(SPEED_TEST_URL, dur=4)

@@ -6,109 +6,221 @@
 <title>Cloudflare WARP 智能分流控制台</title>
 <style>
   :root{
-    --bg:#0e1116; --panel:#161b22; --panel2:#1c2330; --border:#2a3140;
-    --txt:#e6edf3; --sub:#8b949e; --accent:#3b82f6; --green:#22c55e;
-    --red:#ef4444; --amber:#f59e0b; --mono:#39d353; --chip:#21262d;
+    --bg:#0a0e14; --panel:#111823; --panel2:#161f2d; --panel3:#1c2634;
+    --border:#222d3d; --border2:#2e3c50;
+    --txt:#e8eef7; --sub:#8b98a9; --sub2:#616d7c;
+    --accent:#4f8cff; --accent2:#7aa5ff; --accent-soft:rgba(79,140,255,.13);
+    --green:#2ecc71; --green-soft:rgba(46,204,113,.12);
+    --amber:#f5a524; --amber-soft:rgba(245,165,36,.12);
+    --red:#ff5f56; --red-soft:rgba(255,95,86,.12);
+    --mono:#39d353;
+    --shadow:0 10px 30px rgba(0,0,0,.32);
+    --r:16px; --r2:12px;
   }
   [data-theme="light"]{
-    --bg:#f4f6fb; --panel:#ffffff; --panel2:#eef2f8; --border:#d8dee9;
-    --txt:#1c2430; --sub:#5b6573; --accent:#2563eb; --green:#16a34a;
-    --red:#dc2626; --amber:#d97706; --mono:#1a7f37; --chip:#eef2f8;
+    --bg:#f2f5fa; --panel:#ffffff; --panel2:#f4f7fc; --panel3:#eaf0f9;
+    --border:#dde4ee; --border2:#c9d4e3;
+    --txt:#16202e; --sub:#5b6675; --sub2:#8a94a1;
+    --accent:#2f6fe4; --accent2:#5b8ff0; --accent-soft:rgba(47,111,228,.09);
+    --green:#18a85a; --green-soft:rgba(24,168,90,.10);
+    --amber:#d98a06; --amber-soft:rgba(217,138,6,.10);
+    --red:#dc3a30; --red-soft:rgba(220,58,48,.10);
+    --mono:#15803d;
+    --shadow:0 8px 24px rgba(28,44,72,.08);
   }
   *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;padding:24px;transition:background .2s,color .2s}
-  .wrap{max-width:960px;margin:0 auto}
-  header{display:flex;align-items:center;gap:12px;margin-bottom:18px}
-  header .logo{width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,#f38020,#3b82f6);display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:20px;flex:0 0 auto}
-  header h1{font-size:20px;font-weight:700}
-  header .v{font-size:12px;color:var(--sub);margin-top:2px}
+  html{scrollbar-color:var(--border2) transparent}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+    background:var(--bg);color:var(--txt);min-height:100vh;line-height:1.5;
+    transition:background .25s,color .25s;
+    background-image:radial-gradient(1200px 500px at 50% -180px,var(--accent-soft),transparent 70%);
+    background-repeat:no-repeat;
+  }
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:8px}
+  ::-webkit-scrollbar-thumb:hover{background:var(--sub2)}
+  ::-webkit-scrollbar-track{background:transparent}
+  .wrap{max-width:1060px;margin:0 auto;padding:22px 20px 40px}
+
+  /* ---------- 顶栏 ---------- */
+  header{
+    display:flex;align-items:center;gap:14px;margin-bottom:20px;
+    position:sticky;top:0;z-index:30;padding:10px 0;
+    background:linear-gradient(var(--bg) 78%,transparent);
+  }
+  .logo{
+    width:44px;height:44px;border-radius:13px;flex:0 0 auto;
+    background:linear-gradient(135deg,#f6821f,#faae40 45%,#4f8cff);
+    display:flex;align-items:center;justify-content:center;
+    font-weight:800;color:#fff;font-size:21px;
+    box-shadow:0 4px 14px rgba(246,130,31,.35);
+  }
+  header .t{font-size:17px;font-weight:750;letter-spacing:.2px}
+  header .s{font-size:12px;color:var(--sub);margin-top:1px}
   header .spacer{flex:1}
-  .iconbtn{background:var(--panel2);border:1px solid var(--border);border-radius:10px;width:38px;height:38px;cursor:pointer;color:var(--txt);font-size:18px;display:flex;align-items:center;justify-content:center}
-  .iconbtn:hover{border-color:var(--accent)}
-  .banner{display:none;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.5);color:#ffb4ab;border-radius:12px;padding:16px 18px;margin-bottom:16px;font-size:13px;line-height:1.8}
+  .chip{
+    display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;
+    color:var(--sub);background:var(--panel2);border:1px solid var(--border);
+    padding:5px 10px;border-radius:999px;white-space:nowrap;
+  }
+  .chip .d{width:7px;height:7px;border-radius:50%;background:var(--sub2)}
+  .iconbtn{
+    background:var(--panel2);border:1px solid var(--border);border-radius:12px;
+    width:40px;height:40px;cursor:pointer;color:var(--txt);font-size:17px;
+    display:flex;align-items:center;justify-content:center;transition:.15s;flex:0 0 auto;
+  }
+  .iconbtn:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+
+  /* ---------- 提示条 ---------- */
+  .banner{display:none;background:var(--red-soft);border:1px solid rgba(255,95,86,.4);color:var(--txt);border-radius:var(--r2);padding:14px 16px;margin-bottom:14px;font-size:13px;line-height:1.85}
   .banner.show{display:block}
-  .banner b{color:#ff8a7f}
-  .banner code{background:#0a0d12;padding:1px 6px;border-radius:5px;color:#ffd9a8}
-  .ztbanner{display:none;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.5);color:#ffd9a8;border-radius:12px;padding:16px 18px;margin-bottom:16px;font-size:13px;line-height:1.8}
+  .banner b{color:var(--red)}
+  .banner code{background:var(--panel3);padding:1px 6px;border-radius:5px;font-size:12px}
+  .ztbanner{display:none;background:var(--amber-soft);border:1px solid rgba(245,165,36,.4);border-radius:var(--r2);padding:14px 16px;margin-bottom:14px;font-size:13px;line-height:1.85}
   .ztbanner.show{display:block}
-  .healnote{display:none;border-radius:12px;padding:12px 16px;margin-bottom:16px;font-size:12.5px;line-height:1.75;border:1px solid transparent}
+  .ztbanner b{color:var(--amber)}
+  .healnote{display:none;border-radius:var(--r2);padding:13px 16px;margin-bottom:14px;font-size:12.5px;line-height:1.75;border:1px solid transparent}
   .healnote.show{display:block}
-  .healnote.ok{background:rgba(34,197,94,.10);border-color:rgba(34,197,94,.45);color:var(--green)}
-  .healnote.busy{background:rgba(59,130,246,.10);border-color:rgba(59,130,246,.45);color:var(--accent)}
-  .healnote.bad{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.45);color:var(--red)}
+  .healnote.ok{background:var(--green-soft);border-color:rgba(46,204,113,.4);color:var(--txt)}
+  .healnote.busy{background:var(--accent-soft);border-color:rgba(79,140,255,.4);color:var(--txt)}
+  .healnote.bad{background:var(--red-soft);border-color:rgba(255,95,86,.4);color:var(--txt)}
   .healnote b{font-weight:700}
+
+  /* ---------- 卡片 ---------- */
+  .card{
+    background:var(--panel);border:1px solid var(--border);border-radius:var(--r);
+    padding:18px 20px;box-shadow:var(--shadow);
+    transition:border-color .2s,transform .2s;
+  }
+  .card:hover{border-color:var(--border2)}
+  .card h2{
+    font-size:12.5px;color:var(--sub);font-weight:700;margin-bottom:14px;
+    letter-spacing:.5px;display:flex;align-items:center;gap:8px;
+  }
+  .card h2::before{content:"";width:3px;height:13px;border-radius:2px;background:var(--accent);flex:0 0 auto}
+  .card h2 .hint{font-weight:500;color:var(--sub2);letter-spacing:0}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px}
-  .card h2{font-size:13px;color:var(--sub);font-weight:600;margin-bottom:12px;letter-spacing:.3px}
-  .status-pill{display:inline-flex;align-items:center;gap:8px;font-size:15px;font-weight:700;padding:8px 14px;border-radius:999px}
-  .dot{width:10px;height:10px;border-radius:50%}
-  .s-off{background:rgba(139,148,158,.15);color:var(--sub)} .s-off .dot{background:var(--sub)}
-  .s-on{background:rgba(34,197,94,.15);color:var(--green)} .s-on .dot{background:var(--green)}
-  .s-run{background:rgba(245,158,11,.15);color:var(--amber)} .s-run .dot{background:var(--amber);animation:pulse 1s infinite}
-  .s-err{background:rgba(239,68,68,.15);color:var(--red)} .s-err .dot{background:var(--red)}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-  .kv{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px dashed var(--border)}
+  .grid .card{margin:0}
+  .full{grid-column:1 / -1}
+
+  /* ---------- Hero ---------- */
+  .hero{display:flex;gap:22px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+  .hero .left{flex:1 1 340px;min-width:0}
+  .hero .right{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:10px}
+  .status-pill{
+    display:inline-flex;align-items:center;gap:9px;font-size:16px;font-weight:750;
+    padding:9px 16px;border-radius:999px;border:1px solid transparent;
+  }
+  .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto}
+  .s-off{background:var(--panel2);border-color:var(--border);color:var(--sub)} .s-off .dot{background:var(--sub2)}
+  .s-on{background:var(--green-soft);border-color:rgba(46,204,113,.45);color:var(--green)} .s-on .dot{background:var(--green);box-shadow:0 0 10px rgba(46,204,113,.8)}
+  .s-run{background:var(--amber-soft);border-color:rgba(245,165,36,.45);color:var(--amber)} .s-run .dot{background:var(--amber);animation:pulse 1s infinite}
+  .s-err{background:var(--red-soft);border-color:rgba(255,95,86,.45);color:var(--red)} .s-err .dot{background:var(--red)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  .hero .subline{font-size:12.5px;color:var(--sub);margin-top:12px;line-height:1.8}
+  .hero .subline b{color:var(--txt);font-weight:650}
+  .kv{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px;padding:6px 0;border-bottom:1px dashed var(--border)}
   .kv:last-child{border-bottom:none}
-  .kv .k{color:var(--sub)} .kv .val{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
-  .toggle-card{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px}
-  .switch{position:relative;width:160px;height:64px;border-radius:999px;background:var(--panel2);border:1px solid var(--border);cursor:pointer;transition:.25s;user-select:none}
-  .switch .knob{position:absolute;top:5px;left:5px;width:54px;height:54px;border-radius:50%;background:#fff;transition:.25s;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#333}
-  .switch.on{background:linear-gradient(135deg,#16a34a,#22c55e)}
-  .switch.on .knob{left:101px;background:#fff;color:#16a34a}
-  .switch.disabled{opacity:.45;cursor:not-allowed}
-  .switch-label{font-size:15px;font-weight:700}
-  .progress{width:100%;height:10px;background:var(--panel2);border-radius:999px;overflow:hidden;margin-top:6px}
-  .progress > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .3s}
-  .phase{font-size:12px;color:var(--sub);margin-top:6px;text-align:center;min-height:16px}
+  .kv .k{color:var(--sub);white-space:nowrap}
+  .kv .val{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:650;text-align:right;word-break:break-all}
+
+  /* ---------- 大开关 ---------- */
+  .toggle-card{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:22px 20px}
+  .switch{position:relative;width:168px;height:68px;border-radius:999px;background:var(--panel2);border:1px solid var(--border);cursor:pointer;transition:.25s;user-select:none}
+  .switch .knob{position:absolute;top:5px;left:5px;width:56px;height:56px;border-radius:50%;background:#fff;transition:.25s cubic-bezier(.34,1.3,.64,1);display:flex;align-items:center;justify-content:center;font-size:12.5px;font-weight:800;color:#4b5563;box-shadow:0 3px 10px rgba(0,0,0,.3)}
+  .switch.on{background:linear-gradient(135deg,#18a85a,#2ecc71);border-color:rgba(46,204,113,.5);box-shadow:0 0 24px rgba(46,204,113,.35)}
+  .switch.on .knob{left:105px;background:#fff;color:#15803d}
+  .switch.disabled{opacity:.5;cursor:not-allowed}
+  .switch-label{font-size:14px;font-weight:700}
+  .progress{width:100%;height:9px;background:var(--panel2);border:1px solid var(--border);border-radius:999px;overflow:hidden;margin-top:4px}
+  .progress > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4f8cff,#2ecc71);border-radius:999px;transition:width .3s}
+  .phase{font-size:12px;color:var(--sub);text-align:center;min-height:16px}
+
+  /* ---------- 指标磁贴 ---------- */
+  .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px}
+  .tile{
+    background:var(--panel);border:1px solid var(--border);border-radius:var(--r2);
+    padding:16px 18px;box-shadow:var(--shadow);position:relative;overflow:hidden;
+  }
+  .tile::after{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:var(--tc,var(--accent));opacity:.65}
+  .tile .n{font-size:24px;font-weight:800;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:-.5px;line-height:1.1}
+  .tile .n small{font-size:12px;font-weight:600;color:var(--sub);margin-left:3px}
+  .tile .l{font-size:11.5px;color:var(--sub);margin-top:5px}
+  .tile.cn{--tc:var(--green)} .tile.cn .n{color:var(--green)}
+  .tile.intl{--tc:var(--accent)} .tile.intl .n{color:var(--accent)}
+  .tile.spd{--tc:var(--amber)} .tile.spd .n{color:var(--amber)}
+  .tile.up{--tc:#a78bfa} .tile.up .n{color:#a78bfa}
+  [data-theme="light"] .tile.up .n{color:#7c3aed}
+  .chartwrap{position:relative}
+  canvas{width:100%;height:170px;display:block}
+  .legend{display:flex;gap:16px;font-size:11.5px;color:var(--sub);margin-top:10px;flex-wrap:wrap}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+
+  /* ---------- 按钮 ---------- */
   .btns{display:flex;gap:10px;flex-wrap:wrap}
-  button{font-family:inherit;font-size:13px;font-weight:600;color:var(--txt);background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px 14px;cursor:pointer;transition:.15s}
-  button:hover{border-color:var(--accent)}
-  button:active{transform:translateY(1px)}
-  button.danger{color:#fff;background:rgba(239,68,68,.18);border-color:rgba(239,68,68,.5)}
-  button.danger:hover{background:rgba(239,68,68,.32)}
-  button:disabled{opacity:.4;cursor:not-allowed}
-  .mstats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
-  .mstat{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px;text-align:center}
-  .mstat .n{font-size:20px;font-weight:800;font-family:ui-monospace,Menlo,Consolas,monospace}
-  .mstat .l{font-size:11px;color:var(--sub);margin-top:2px}
-  .mstat .n.cn{color:var(--green)} .mstat .n.intl{color:var(--accent)} .mstat .n.spd{color:var(--amber)}
-  canvas{width:100%;height:150px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;display:block}
-  .legend{display:flex;gap:14px;font-size:11px;color:var(--sub);margin-top:6px}
-  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
-  .settings .row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px dashed var(--border)}
+  button{font-family:inherit;font-size:13px;font-weight:650;color:var(--txt);background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px 15px;cursor:pointer;transition:.15s}
+  button:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+  button:active{transform:translateY(0)}
+  button.danger{color:var(--red);background:var(--red-soft);border-color:rgba(255,95,86,.4)}
+  button.danger:hover{background:rgba(255,95,86,.2);color:var(--red)}
+  button:disabled{opacity:.45;cursor:not-allowed;transform:none}
+  .mini{font-size:11px;padding:5px 9px;border-radius:8px}
+
+  /* ---------- 开关行 ---------- */
+  .settings .row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:11px 0;border-bottom:1px dashed var(--border)}
   .settings .row:last-child{border-bottom:none}
-  .settings .row .desc{font-size:11px;color:var(--sub);margin-top:2px}
-  .tswitch{position:relative;width:46px;height:26px;border-radius:999px;background:var(--border);cursor:pointer;transition:.2s;flex:0 0 auto}
-  .tswitch::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.2s}
-  .tswitch.on{background:var(--accent)}
-  .tswitch.on::after{left:23px}
-  .seg{display:flex;gap:6px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:4px}
-  .segbtn{flex:1;padding:9px 6px;border:0;border-radius:7px;background:transparent;color:var(--sub);font-size:13px;cursor:pointer;transition:.15s;font-family:inherit}
-  .segbtn:hover{color:var(--txt)}
-  .segbtn.on{background:var(--accent);color:#fff;font-weight:600}
-  .routedesc{margin-top:10px;font-size:12px;color:var(--sub);line-height:1.7}
-  .routedesc b{color:var(--txt);font-weight:600}
-  .portbox{margin-top:12px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
-  .dnsnote{margin-top:8px;font-size:12px;color:var(--sub);line-height:1.7;display:none}
+  .settings .row .desc{font-size:11.5px;color:var(--sub);margin-top:2px;line-height:1.6}
+  .row.tight{padding:8px 0;border-bottom:none}
+  .tswitch{position:relative;width:48px;height:27px;border-radius:999px;background:var(--border);cursor:pointer;transition:.2s;flex:0 0 auto;border:1px solid transparent}
+  .tswitch::after{content:"";position:absolute;top:2px;left:2px;width:21px;height:21px;border-radius:50%;background:#fff;transition:.2s cubic-bezier(.34,1.3,.64,1);box-shadow:0 2px 5px rgba(0,0,0,.25)}
+  .tswitch.on{background:var(--accent);border-color:var(--accent)}
+  .tswitch.on::after{left:24px}
+
+  /* ---------- 分段选择 ---------- */
+  .seg{display:flex;gap:5px;background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:4px}
+  .segbtn{flex:1;padding:10px 6px;border:0;border-radius:9px;background:transparent;color:var(--sub);font-size:13px;cursor:pointer;transition:.15s;font-family:inherit;font-weight:650}
+  .segbtn:hover{color:var(--txt);transform:none}
+  .segbtn.on{background:var(--accent);color:#fff;font-weight:700;box-shadow:0 3px 12px rgba(79,140,255,.35)}
+  .routedesc{margin-top:12px;font-size:12px;color:var(--sub);line-height:1.75}
+  .routedesc b{color:var(--txt);font-weight:650}
+  .portbox{margin-top:12px;background:var(--panel2);border:1px solid var(--border);border-radius:var(--r2);padding:12px 14px}
+  .dnsnote{margin-top:10px;font-size:12px;color:var(--sub);line-height:1.75;display:none;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--panel2)}
   .dnsnote.show{display:block}
-  .dnsnote.warn{color:var(--warn,#f5a524)}
-  .dnsnote b{color:var(--txt);font-weight:600}
-  .rules .list{max-height:160px;overflow-y:auto;margin-bottom:10px}
-  .rule{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;margin-bottom:6px;font-size:13px}
+  .dnsnote.warn{color:var(--amber);border-color:rgba(245,165,36,.35);background:var(--amber-soft)}
+  .dnsnote.ok{color:var(--green);border-color:rgba(46,204,113,.35);background:var(--green-soft)}
+  .dnsnote b{color:inherit;font-weight:750}
+
+  /* ---------- 规则 ---------- */
+  .rules .list{max-height:170px;overflow-y:auto;margin-bottom:12px;padding-right:4px}
+  .rule{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;margin-bottom:7px;font-size:13px}
   .rule .meta{color:var(--sub);font-size:11px}
-  .rule .ops{display:flex;gap:6px;align-items:center}
-  .mini{font-size:11px;padding:4px 8px}
-  textarea,input[type=text]{width:100%;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background:var(--panel2);color:var(--txt);border:1px solid var(--border);border-radius:8px;padding:8px;resize:vertical}
-  .field{margin-bottom:10px}
-  .field label{display:block;font-size:11px;color:var(--sub);margin-bottom:4px}
-  .logcard{grid-column:1 / -1}
-  .log{background:#0a0d12;border:1px solid var(--border);border-radius:10px;height:200px;overflow-y:auto;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.6;color:var(--mono)}
+  .rule .ops{display:flex;gap:6px;align-items:center;flex:0 0 auto}
+  textarea,input[type=text]{width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:var(--panel2);color:var(--txt);border:1px solid var(--border);border-radius:10px;padding:9px 11px;resize:vertical;transition:.15s}
+  textarea:focus,input[type=text]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .field{margin-bottom:11px}
+  .field label{display:block;font-size:11.5px;color:var(--sub);margin-bottom:5px}
+
+  /* ---------- 日志 ---------- */
+  .log{background:#0a0e13;border:1px solid var(--border);border-radius:var(--r2);height:210px;overflow-y:auto;padding:13px 15px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.75;color:var(--mono)}
+  [data-theme="light"] .log{background:#0d1420}
   .log .err{color:#ff7b72}
-  .footer{margin-top:14px;font-size:12px;color:var(--sub);text-align:center;line-height:1.7}
-  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--panel);border:1px solid var(--border);padding:10px 18px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:.3s;z-index:50}
-  .toast.show{opacity:1}
+
+  .footer{margin-top:18px;font-size:12px;color:var(--sub2);text-align:center;line-height:1.8}
+  .toast{
+    position:fixed;bottom:26px;left:50%;transform:translateX(-50%) translateY(8px);
+    background:var(--panel);border:1px solid var(--border2);padding:11px 20px;border-radius:12px;
+    font-size:13px;font-weight:600;opacity:0;pointer-events:none;transition:.25s;z-index:50;
+    box-shadow:0 12px 32px rgba(0,0,0,.4);backdrop-filter:blur(8px);
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   .hidden{display:none}
-  @media(max-width:680px){.grid{grid-template-columns:1fr}.mstats{grid-template-columns:repeat(2,1fr)}}
+
+  @media(max-width:760px){
+    .grid{grid-template-columns:1fr}
+    .tiles{grid-template-columns:repeat(2,1fr)}
+    .hero{gap:14px}
+  }
 </style>
 </head>
 <body>
@@ -116,21 +228,26 @@
   <header>
     <div class="logo">W</div>
     <div>
-      <h1>Cloudflare WARP 智能分流控制台</h1>
-      <div class="v">国际走 WARP 出口 · 国内直连 · 速率/延迟监控 · 开机自启 · 系统托盘</div>
+      <div class="t">Cloudflare WARP 智能分流</div>
+      <div class="s">国际走 WARP 出口 · 国内直连 · 速率 / 延迟监控 · 网络保障</div>
     </div>
     <div class="spacer"></div>
-    <button class="iconbtn" id="btnTheme" title="切换暗/亮主题">🌙</button>
+    <div class="chip" id="chipVer"><span class="d"></span>控制台</div>
+    <button class="iconbtn" id="btnTheme" title="切换暗 / 亮主题">🌙</button>
   </header>
 
   <div class="banner" id="banner"></div>
   <div class="ztbanner" id="ztbanner"></div>
   <div class="healnote" id="healNote"></div>
 
+  <!-- Hero: 状态 + 开关 -->
   <div class="grid">
     <div class="card">
       <h2>运行状态</h2>
-      <div id="statusPill" class="status-pill s-off"><span class="dot"></span><span id="statusText">未启用</span></div>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <div id="statusPill" class="status-pill s-off"><span class="dot"></span><span id="statusText">未启用</span></div>
+        <div style="font-size:12.5px;color:var(--sub)" id="heroHint">启用后国际流量经 WARP 出口，国内流量直连</div>
+      </div>
       <div style="margin-top:14px">
         <div class="kv"><span class="k">WARP 连接</span><span class="val" id="kvConn">—</span></div>
         <div class="kv"><span class="k">当前模式</span><span class="val" id="kvMode">—</span></div>
@@ -144,12 +261,35 @@
       <h2 style="align-self:flex-start">分流开关</h2>
       <div id="switch" class="switch disabled"><div class="knob">OFF</div></div>
       <div class="switch-label" id="switchLabel">点击启用</div>
-      <div class="progress"><i id="progBar"></i></div>
-      <div class="phase" id="phase">空闲</div>
+      <div style="width:100%">
+        <div class="progress"><i id="progBar"></i></div>
+        <div class="phase" id="phase">空闲</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 指标磁贴 -->
+  <div class="tiles">
+    <div class="tile cn"><div class="n" id="mCn">—</div><div class="l">国内延迟 (ms)</div></div>
+    <div class="tile intl"><div class="n" id="mIntl">—</div><div class="l">国际延迟 (ms)</div></div>
+    <div class="tile spd"><div class="n" id="mSpd">—</div><div class="l">下载速率 (Mbps)</div></div>
+    <div class="tile up"><div class="n" id="mUp">—</div><div class="l">在线时长</div></div>
+  </div>
+
+  <!-- 曲线 -->
+  <div class="grid">
+    <div class="card full">
+      <h2>网络质量趋势 <span class="hint">最近约 3 分钟 · 延迟 ms / 速率 Mbps</span></h2>
+      <div class="chartwrap"><canvas id="chart"></canvas></div>
+      <div class="legend">
+        <span><i style="background:var(--green)"></i>国内延迟</span>
+        <span><i style="background:var(--accent)"></i>国际延迟</span>
+        <span><i style="background:var(--amber)"></i>下载速率</span>
+      </div>
     </div>
 
     <div class="card">
-      <h2>分路模式 <span style="font-size:11px;color:var(--sub)">（切换前会先停用）</span></h2>
+      <h2>分路模式 <span class="hint">（切换前会先停用）</span></h2>
       <div class="seg" id="segRoute">
         <button class="segbtn" data-mode="tun">TUN 全局</button>
         <button class="segbtn" data-mode="proxy">Proxy 分路</button>
@@ -159,7 +299,7 @@
         <div class="kv"><span class="k">分流桥 HTTP</span><span class="val" id="kvBridge">—</span></div>
         <div class="kv"><span class="k">WARP SOCKS5</span><span class="val" id="kvSocks">—</span></div>
         <div class="kv"><span class="k">桥接 直连 / 代理</span><span class="val" id="kvBstat">—</span></div>
-        <div class="row" style="margin-top:10px">
+        <div class="row tight" style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;gap:12px">
           <div><div>写入系统代理</div><div class="desc">让不认 SOCKS 的普通应用也走分流；局域网与 localhost 自动绕过</div></div>
           <div class="tswitch" id="swSysProxy"></div>
         </div>
@@ -170,7 +310,7 @@
         <div class="kv"><span class="k">WARP 交给谁解析</span><span class="val" id="kvFbSrv">—</span></div>
         <div class="kv"><span class="k">网卡 DNS（参考）</span><span class="val" id="kvNicDns">—</span></div>
         <div class="dnsnote" id="dnsNote"></div>
-        <div class="row" style="margin-top:10px">
+        <div class="row tight" style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;gap:12px">
           <div><div>智能 DNS 分流</div><div class="desc">WARP 把 DNS 经隧道送出境，国内 CDN 因此把你当境外用户、返回海外节点 —— 这是分流后带宽跑不满的主因（实测国内镜像：海外节点 80 Mbps / 首包 2.4s，国内节点 183 Mbps / 首包 0.08s）。开启后本地代理按域名分流解析</div></div>
           <div class="tswitch" id="swSmartDns"></div>
         </div>
@@ -178,18 +318,20 @@
     </div>
 
     <div class="card">
-      <h2>网络质量监控 <span style="font-size:11px;color:var(--sub)">（延迟 ms · 速率 Mbps）</span></h2>
-      <div class="mstats">
-        <div class="mstat"><div class="n cn" id="mCn">—</div><div class="l">国内延迟</div></div>
-        <div class="mstat"><div class="n intl" id="mIntl">—</div><div class="l">国际延迟</div></div>
-        <div class="mstat"><div class="n spd" id="mSpd">—</div><div class="l">下载速率</div></div>
-        <div class="mstat"><div class="n" id="mUp">—</div><div class="l">在线时长</div></div>
+      <h2>网络保障 <span class="hint">（底线：任何时候都要能上网）</span></h2>
+      <div class="kv"><span class="k">当前联网状态</span><span class="val" id="kvNetOk">—</span></div>
+      <div class="kv"><span class="k">最近一次自动处理</span><span class="val" id="kvRescue">无</span></div>
+      <div class="dnsnote" id="netNote"></div>
+      <div class="row tight" style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;gap:12px">
+        <div><div>看门狗（程序运行时）</div><div class="desc">每 20 秒探测一次联网；连续两次失败就自动逐级退让：先还原网卡 DNS → 再断开 WARP 回到直连 → 最后强制清空 DNS。与分流是否启用无关，全程在跑</div></div>
+        <div class="tswitch" id="swNetGuard"></div>
       </div>
-      <canvas id="chart" width="520" height="150"></canvas>
-      <div class="legend">
-        <span><i style="background:var(--green)"></i>国内延迟</span>
-        <span><i style="background:var(--accent)"></i>国际延迟</span>
-        <span><i style="background:var(--amber)"></i>下载速率</span>
+      <div class="row tight" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+        <div><div>系统兜底任务</div><div class="desc">注册系统计划任务，每 5 分钟巡检一次 —— 程序被强杀或没启动时，靠它兜住「DNS 残留导致全机断网」</div></div>
+        <div class="tswitch" id="swGuardTask"></div>
+      </div>
+      <div class="btns" style="margin-top:14px">
+        <button id="btnRescue">立即网络急救</button>
       </div>
     </div>
 
@@ -197,36 +339,20 @@
       <h2>快速操作</h2>
       <div class="btns">
         <button id="btnSelfTest">分流自检</button>
-        <button id="btnFixIpv6">修复IPv6</button>
+        <button id="btnFixIpv6">修复 IPv6</button>
         <button id="btnUpdateList">更新中国IP列表</button>
         <button id="btnDisable">停用分流</button>
         <button id="btnRestore" class="danger">一键还原</button>
         <button id="btnRefresh">刷新</button>
       </div>
-      <div style="margin-top:12px;font-size:12px;color:var(--sub);line-height:1.7">
-        启用后：国际流量经 WARP 加密出口，国内网站/游戏直连。<br>
-        停用 / 一键还原：断开 WARP 并清空分流规则，<b>网络立即恢复正常</b>。
+      <div style="margin-top:14px;font-size:12px;color:var(--sub);line-height:1.8">
+        启用后：国际流量经 WARP 加密出口，国内网站 / 游戏直连。<br>
+        停用 / 一键还原：断开 WARP 并清空分流规则，<b style="color:var(--txt)">网络立即恢复正常</b>。
       </div>
     </div>
+  </div>
 
-    <div class="card">
-      <h2>网络保障 <span style="font-size:11px;color:var(--sub)">（底线：任何时候都要能上网）</span></h2>
-      <div class="kv"><span class="k">当前联网状态</span><span class="val" id="kvNetOk">—</span></div>
-      <div class="kv"><span class="k">最近一次自动处理</span><span class="val" id="kvRescue">无</span></div>
-      <div class="dnsnote" id="netNote"></div>
-      <div class="row" style="margin-top:10px">
-        <div><div>看门狗（程序运行时）</div><div class="desc">每 20 秒探测一次联网；连续两次失败就自动逐级退让：先还原网卡 DNS → 再断开 WARP 回到直连 → 最后强制清空 DNS。与分流是否启用无关，全程在跑</div></div>
-        <div class="tswitch" id="swNetGuard"></div>
-      </div>
-      <div class="row">
-        <div><div>系统兜底任务</div><div class="desc">注册系统计划任务，每 5 分钟巡检一次 —— 程序被强杀或没启动时，靠它兜住「DNS 残留导致全机断网」</div></div>
-        <div class="tswitch" id="swGuardTask"></div>
-      </div>
-      <div class="btns" style="margin-top:12px">
-        <button id="btnRescue">立即网络急救</button>
-      </div>
-    </div>
-
+  <div class="grid">
     <div class="card settings">
       <h2>设置</h2>
       <div class="row">
@@ -238,7 +364,7 @@
         <div class="tswitch" id="swReconnect"></div>
       </div>
       <div class="row">
-        <div><div>自动自愈</div><div class="desc">国内/国际探测连续失败时自动重连重注入；反复无效则自动还原为直连，保证不断网</div></div>
+        <div><div>自动自愈</div><div class="desc">国内 / 国际探测连续失败时自动重连重注入；反复无效则自动还原为直连，保证不断网</div></div>
         <div class="tswitch" id="swAutoHeal"></div>
       </div>
       <div class="row">
@@ -250,7 +376,7 @@
         <div class="tswitch" id="swAutoUpdate"></div>
       </div>
       <div class="row">
-        <div><div>速率监测</div><div class="desc">定期测量下载速率 (每约30秒)</div></div>
+        <div><div>速率监测</div><div class="desc">定期测量下载速率 (每约 30 秒)</div></div>
         <div class="tswitch" id="swSpeed"></div>
       </div>
       <div class="row">
@@ -260,7 +386,7 @@
     </div>
 
     <div class="card rules">
-      <h2>规则列表管理 <span style="font-size:11px;color:var(--sub)">（可导入自定义/多份 CIDR 列表）</span></h2>
+      <h2>规则列表管理 <span class="hint">（可导入自定义 / 多份 CIDR 列表）</span></h2>
       <div class="list" id="ruleList"></div>
       <div class="field">
         <label>名称</label>
@@ -275,13 +401,15 @@
         <button id="btnImportUrl">从 URL 导入</button>
       </div>
     </div>
+  </div>
 
-    <div class="card logcard hidden" id="selfTestCard">
-      <h2>分流自检结果 <span style="font-size:11px;color:var(--sub)">（验证国际是否走 WARP、国内是否直连）</span></h2>
+  <div class="grid">
+    <div class="card full hidden" id="selfTestCard">
+      <h2>分流自检结果 <span class="hint">（验证国际是否走 WARP、国内是否直连）</span></h2>
       <div id="selfTestBody"></div>
     </div>
 
-    <div class="card logcard">
+    <div class="card full">
       <h2>运行日志</h2>
       <div class="log" id="log"></div>
     </div>
@@ -355,6 +483,9 @@ function setStatus(st){
   else if(st.running){ pill.classList.add("s-run"); txt.textContent="操作中..."; }
   else if(st.enabled && st.connected){ pill.classList.add("s-on"); txt.textContent="分流中"; }
   else { pill.classList.add("s-off"); txt.textContent="未启用"; }
+  $("heroHint").textContent =
+    (st.enabled && st.connected) ? "分流正在生效 —— 国际流量经 WARP 出口，国内流量直连"
+    : (st.resume_pending ? "上次的分流未恢复，点开关即可约 1 秒启用" : "启用后国际流量经 WARP 出口，国内流量直连");
 
   const cf = (st.egress_ip||"")!=="获取失败" && /^(104\.|162\.|172\.64|188\.114|198\.41|141\.101|190\.93|2606:|2400:)/.test(st.egress_ip||"");
   $("kvConn").textContent = st.connected ? "已连接" : "未连接";
@@ -438,7 +569,7 @@ function setStatus(st){
     dn.className="dnsnote show warn";
     dn.innerHTML="<b>⚠ DNS 仍在 WARP 手里</b>：国内 CDN 会按境外来源返回海外节点，流量绕一圈再回来 —— 这就是带宽跑不满的原因。请检查上方是否显示「已接管」。";
   } else if(!isProxy && st.dns_proxy){
-    dn.className="dnsnote show";
+    dn.className="dnsnote show ok";
     dn.innerHTML="<b>✓ 已接管</b>：国内域名用国内 DNS 解析（拿到国内 CDN 节点，走直连），境外域名走公网 DNS 经隧道查询（不会被污染）。";
   } else { dn.className="dnsnote"; }
 
@@ -457,7 +588,7 @@ function setStatus(st){
     nn.innerHTML = "<b>⚠ 为保障网络已自动暂停分流</b>：看门狗判定联网异常后断开了 WARP，"
       + "并且<b>不会自动重开</b> —— 是否恢复分流由你决定。确认网络正常后，用上方开关重新启用即可。";
   } else if(netOk){
-    nn.className = "dnsnote show";
+    nn.className = "dnsnote show ok";
     nn.innerHTML = "<b>✓ 联网正常</b>：看门狗每 20 秒探测一次；一旦连续失败会自动退让，先保网络再谈加速。";
   } else {
     nn.className = "dnsnote show warn";
@@ -499,46 +630,106 @@ function loadLog(){
 
 // ---- 指标 + 图表 ----
 function fmt(n){ return (n===null||n===undefined)?"—":n; }
+function fmtUptime(s){
+  if(!s||s<1) return "—";
+  const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60), sec=Math.floor(s%60);
+  if(d>0) return d+'<small>天</small>'+(h+'<small>时</small>');
+  if(h>0) return h+'<small>时</small>'+(m+'<small>分</small>');
+  if(m>0) return m+'<small>分</small>'+(sec+'<small>秒</small>');
+  return sec+'<small>秒</small>';
+}
+let upBase = 0, upAt = 0;   // 在线时长本地走秒, 不用等下一轮轮询
+function renderUptime(){
+  if(upBase<=0 || Date.now()-upAt > 15000){ $("mUp").innerHTML="—"; return; }
+  $("mUp").innerHTML = fmtUptime(upBase + Math.floor((Date.now()-upAt)/1000));
+}
+setInterval(renderUptime, 1000);
 function loadMetrics(){
   fetch("/api/metrics").then(r=>r.json()).then(d=>{
-    $("mCn").textContent = fmt(d.latency_cn);
-    $("mIntl").textContent = fmt(d.latency_intl);
-    $("mSpd").textContent = fmt(d.dl_speed_mbps);
-    const up = d.uptime_s||0;
-    $("mUp").textContent = up>0 ? (up>=3600? (up/3600).toFixed(1)+"h" : (up/60).toFixed(0)+"m") : "—";
+    $("mCn").innerHTML = fmt(d.latency_cn);
+    $("mIntl").innerHTML = fmt(d.latency_intl);
+    $("mSpd").innerHTML = fmt(d.dl_speed_mbps);
+    if(d.uptime_s>0){ upBase = d.uptime_s; upAt = Date.now(); }
+    renderUptime();
     drawChart(d.history||[]);
   }).catch(()=>{});
 }
+
+function cssVar(name){
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
 function drawChart(hist){
   const c=$("chart"); const ctx=c.getContext("2d");
-  const W=c.width, H=c.height, pad=6;
+  // 按容器宽度 + 设备像素比重绘, 避免高清屏发虚
+  const dpr = window.devicePixelRatio||1;
+  const W=c.clientWidth, H=c.clientHeight;
+  if(W<10||H<10) return;
+  if(c.width !== Math.round(W*dpr) || c.height !== Math.round(H*dpr)){
+    c.width = Math.round(W*dpr); c.height = Math.round(H*dpr);
+  }
+  ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,W,H);
   if(hist.length<2) return;
+  const padL=34, padR=8, padT=10, padB=18;
   let maxLat=50, maxSpd=10;
   hist.forEach(p=>{
     if(p.cn!=null) maxLat=Math.max(maxLat,p.cn);
     if(p.intl!=null) maxLat=Math.max(maxLat,p.intl);
     if(p.spd!=null) maxSpd=Math.max(maxSpd,p.spd);
   });
-  maxLat*=1.1; maxSpd*=1.1;
+  maxLat*=1.15; maxSpd*=1.15;
   const n=hist.length;
-  const x=i=> pad + i*(W-2*pad)/(n-1);
-  const yLat=v=> H-pad - (v/maxLat)*(H-2*pad);
-  const ySpd=v=> H-pad - (v/maxSpd)*(H-2*pad);
-  // 速率填充
+  const x=i=> padL + i*(W-padL-padR)/(n-1);
+  const yLat=v=> H-padB - (v/maxLat)*(H-padT-padB);
+  const ySpd=v=> H-padB - (v/maxSpd)*(H-padT-padB);
+
+  // 网格 + 纵轴刻度
+  const grid = cssVar("--border") || "#222d3d", sub = cssVar("--sub2") || "#616d7c";
+  ctx.font = "10px ui-monospace,Menlo,Consolas,monospace";
+  ctx.textBaseline = "middle";
+  for(let g=0; g<=3; g++){
+    const Y = padT + (H-padT-padB)*g/3;
+    ctx.strokeStyle = grid; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL,Y); ctx.lineTo(W-padR,Y); ctx.stroke();
+    ctx.fillStyle = sub; ctx.textAlign = "right";
+    ctx.fillText(Math.round(maxLat*(1-g/3)), padL-6, Y);
+  }
+  // 横轴: 时间跨度
+  ctx.textAlign="center"; ctx.fillStyle=sub;
+  const span = (hist[n-1].t - hist[0].t)||1;
+  const lbl = span>=120 ? Math.round(span/60)+"分钟前" : span+"秒前";
+  ctx.fillText(lbl, padL+(W-padL-padR)/2, H-6);
+
+  // 速率: 渐变面积 + 线
+  const grd = ctx.createLinearGradient(0,padT,0,H-padB);
+  grd.addColorStop(0,"rgba(245,165,36,.30)");
+  grd.addColorStop(1,"rgba(245,165,36,0)");
   ctx.beginPath();
   hist.forEach((p,i)=>{ const v=p.spd==null?0:p.spd; const X=x(i),Y=ySpd(v); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); });
-  ctx.lineTo(x(n-1),H-pad); ctx.lineTo(x(0),H-pad); ctx.closePath();
-  ctx.fillStyle="rgba(245,158,11,.12)"; ctx.fill();
-  const line=(key,color,scale)=>{
-    ctx.beginPath(); ctx.strokeStyle=color; ctx.lineWidth=2;
-    hist.forEach((p,i)=>{ const v=p[key]; if(v==null) return; const X=x(i),Y=scale(v); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); });
+  ctx.lineTo(x(n-1),H-padB); ctx.lineTo(x(0),H-padB); ctx.closePath();
+  ctx.fillStyle=grd; ctx.fill();
+
+  const line=(key,color,scale,width)=>{
+    ctx.beginPath(); ctx.strokeStyle=color; ctx.lineWidth=width||2;
+    ctx.lineJoin="round"; ctx.lineCap="round";
+    hist.forEach((p,i)=>{ const v=p[key]==null?null:p[key];
+      if(v==null) return; const X=x(i),Y=scale(v);
+      if(ctx.__started) ctx.lineTo(X,Y); else { ctx.moveTo(X,Y); ctx.__started=true; } });
+    ctx.__started=false;
     ctx.stroke();
+    // 末端点 + 当前值
+    for(let i=n-1;i>=0;i--){ const v=hist[i][key];
+      if(v==null) continue;
+      ctx.beginPath(); ctx.arc(x(i),scale(v),3,0,Math.PI*2); ctx.fillStyle=color; ctx.fill();
+      ctx.fillStyle=color; ctx.textAlign="right"; ctx.textBaseline="middle";
+      ctx.fillText(String(v), Math.min(x(i)+14, W-padR), scale(v));
+      break; }
   };
-  line("intl","#3b82f6",yLat);
-  line("cn","#22c55e",yLat);
-  line("spd","#f59e0b",ySpd);
+  line("intl","#4f8cff",yLat);
+  line("cn","#2ecc71",yLat);
+  line("spd","#f5a524",ySpd,2);
 }
+window.addEventListener("resize", ()=>{ /* 容器尺寸变了下次绘制自动适配 */ });
 
 // ---- 请求封装 ----
 function post(path,btn){
@@ -630,61 +821,69 @@ function renderSelfTest(d){
         (dns.doh&&dns.doh.length?'<br>DoH: '+dns.doh.join(", "):"")+'</div>'; })();
 }
 
-// ---- 设置开关 ----
-$("swReconnect").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swReconnect",on); postJSON("/api/settings",{auto_reconnect:on}); });
-$("swAutoHeal").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swAutoHeal",on); postJSON("/api/settings",{auto_heal:on}); });
-document.querySelectorAll("#segRoute .segbtn").forEach(function(b){
+// ---- 分路切换 ----
+document.querySelectorAll("#segRoute .segbtn").forEach(b=>{
   b.addEventListener("click",function(){
     const m=this.dataset.mode;
-    if(this.classList.contains("on")) return;
-    document.querySelectorAll("#segRoute .segbtn").forEach(x=>x.classList.remove("on"));
-    this.classList.add("on");
-    toast(m==="proxy"?"正在切换到 Proxy 分路（先停用再启用）":"正在切换到 TUN 全局");
-    postJSON("/api/route",{mode:m}).then(loadStatus);
+    fetch("/api/route",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:m})})
+      .then(r=>r.json()).then(d=>{ toast(d.msg||"正在切换分路..."); loadStatus(); })
+      .catch(()=>toast("请求失败"));
   });
 });
-$("swSysProxy").addEventListener("click",function(){
-  const on=!this.classList.contains("on"); setToggle("swSysProxy",on);
-  postJSON("/api/system-proxy",{on:on}).then(r=>{
-    toast(on?"已把分流桥写入系统代理（局域网已绕过）":"已还原系统代理设置");
-    loadStatus();
+
+// ---- 设置开关 ----
+[["swSysProxy","system_proxy"],["swReconnect","auto_reconnect"],["swAutoHeal","auto_heal"],
+ ["swAutoResume","auto_resume"],["swAutoUpdate","auto_update"],["swSpeed","metrics_speed"],
+ ["swTray","tray"],["swSmartDns","smart_dns"]].forEach(([id,key])=>{
+  const el=$(id); if(!el) return;
+  el.addEventListener("click",()=>{
+    const on=!el.classList.contains("on");
+    if(key==="system_proxy"){
+      setToggle(id,on);
+      fetch("/api/system-proxy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({on:on})})
+        .then(r=>r.json()).then(d=>{ if(!d.ok){ setToggle(id,!on); toast("设置失败"); } else toast(on?"已写入系统代理（局域网已绕过）":"已还原系统代理"); })
+        .catch(()=>{ setToggle(id,!on); toast("请求失败"); });
+      return;
+    }
+    setToggle(id,on);
+    postJSON("/api/settings",{[key]:on});
+    if(key==="smart_dns") toast(on?"已开启智能 DNS 分流：国内域名解析到国内节点":"已关闭智能 DNS 分流，网卡 DNS 还原");
+    if(key==="auto_resume") toast(on?"程序启动时会自动恢复上次的分流状态":"程序启动后不会自己动网络");
   });
 });
-$("swSmartDns").addEventListener("click",function(){
-  const on=!this.classList.contains("on"); setToggle("swSmartDns",on);
-  postJSON("/api/settings",{smart_dns:on}).then(r=>{
-    toast(on?"已开启智能 DNS 分流：国内域名解析到国内节点":"已关闭智能 DNS 分流，网卡 DNS 还原");
-    setTimeout(loadStatus,1200);
-  });
-});
-$("swAutoResume").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swAutoResume",on); postJSON("/api/settings",{auto_resume:on}); toast(on?"程序启动时会自动恢复上次的分流状态":"程序启动后不会自己动网络"); });
-$("swAutoUpdate").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swAutoUpdate",on); postJSON("/api/settings",{auto_update:on}); });
-$("swSpeed").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swSpeed",on); postJSON("/api/settings",{metrics_speed:on}); });
-$("swTray").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swTray",on); postJSON("/api/settings",{tray:on}); toast("托盘设置已保存，重启后生效"); });
+
+// ---- 开机自启 ----
+function loadAutostart(){
+  fetch("/api/autostart").then(r=>r.json()).then(d=>{ setToggle("swAutostart", !!d.enabled); })
+  .catch(()=>{});
+}
 $("swAutostart").addEventListener("click",function(){
   const on=!this.classList.contains("on");
-  if(on){ postJSON("/api/autostart/enable").then(d=>{ toast(d&&d.msg?d.msg:"已设置开机自启"); loadAutostart(); }); }
-  else { postJSON("/api/autostart/disable").then(d=>{ toast(d&&d.msg?d.msg:"已取消开机自启"); loadAutostart(); }); }
+  setToggle("swAutostart",on);
+  fetch("/api/autostart/"+(on?"enable":"disable"),{method:"POST"})
+    .then(r=>r.json()).then(d=>{ toast(d.msg||"已更新"); loadAutostart(); })
+    .catch(()=>toast("请求失败"));
 });
-function loadAutostart(){
-  fetch("/api/autostart").then(r=>r.json()).then(d=>setToggle("swAutostart", d.enabled)).catch(()=>{});
-}
 
 // ---- 规则列表 ----
 function loadRules(){
   fetch("/api/rules").then(r=>r.json()).then(d=>{
-    const el=$("ruleList"); const lists=d.lists||[];
-    el.innerHTML = lists.map(l=>{
-      const active=l.active;
-      return '<div class="rule"><div><b>'+l.name+'</b> <span class="meta">'+l.count+' 条</span></div>'+
-        '<div class="ops">'+
-        (active?'<span class="meta">已激活</span>':'<button class="mini" data-act="on" data-n="'+l.name+'">激活</button>')+
-        (l.name!=="china_cidr.txt"?'<button class="mini danger" data-act="del" data-n="'+l.name+'">删除</button>':'')+
-        '</div></div>';
-    }).join("") || '<div class="meta">暂无自定义规则</div>';
+    const el=$("ruleList"); const list=d.rules||d.lists||[];
+    if(!list.length){ el.innerHTML='<div style="font-size:12px;color:var(--sub);padding:8px 0">暂无规则列表</div>'; return; }
+    el.innerHTML = list.map(r=>{
+      const nm = r.name, cnt = r.count!=null? r.count : 0;
+      const act = r.active!==false;
+      return '<div class="rule"><div><div>'+nm.replace(/</g,"&lt;")+'</div>'
+        + '<div class="meta">'+cnt+' 条</div></div>'
+        + '<div class="ops">'
+        + (act ? '<span class="chip"><span class="d" style="background:var(--green)"></span>已激活</span>'
+               : '<button class="mini" data-n="'+nm.replace(/</g,"&lt;")+'" data-act="on">激活</button>')
+        + (nm!=="china_cidr.txt" ? '<button class="mini danger" data-n="'+nm.replace(/</g,"&lt;")+'" data-act="del">删除</button>' : '')
+        + '</div></div>';
+    }).join("") || '<div style="font-size:12px;color:var(--sub);padding:8px 0">暂无自定义规则</div>';
     el.querySelectorAll("button[data-act]").forEach(b=>{
-      b.addEventListener("click",()=>{
-        const n=b.getAttribute("data-n"), act=b.getAttribute("data-act");
+      b.addEventListener("click",function(){
+        const n=this.dataset.n, act=this.dataset.act;
         if(act==="del"){ postJSON("/api/rules/delete",{name:n}).then(()=>{toast("已删除");loadRules();}); }
         if(act==="on"){ postJSON("/api/rules/toggle",{name:n,active:true}).then(()=>{toast("已激活");loadRules();loadStatus();}); }
       });
@@ -692,23 +891,22 @@ function loadRules(){
   }).catch(()=>{});
 }
 $("btnImportText").addEventListener("click",function(){
-  const name=$("ruleName").value.trim(); const text=$("ruleText").value.trim();
-  if(!name||!text){ toast("请填写名称和CIDR内容"); return; }
+  const name=$("ruleName").value.trim(), text=$("ruleText").value.trim();
+  if(!name||!text){ toast("请填写名称和 CIDR 内容"); return; }
   this.disabled=true;
   postJSON("/api/rules/import",{name:name,source:"text",value:text}).then(d=>{ toast(d&&d.msg?d.msg:"已导入"); if(d&&d.ok){$("ruleText").value="";loadRules();loadStatus();} this.disabled=false; });
 });
 $("btnImportUrl").addEventListener("click",function(){
-  const name=$("ruleName").value.trim(); const text=$("ruleText").value.trim();
-  if(!name||!text){ toast("请填写名称并在文本框粘贴 URL"); return; }
+  const name=$("ruleName").value.trim(), text=$("ruleText").value.trim();
+  if(!name||!text){ toast("请填写名称和 URL"); return; }
   this.disabled=true;
   postJSON("/api/rules/import",{name:name,source:"url",value:text}).then(d=>{ toast(d&&d.msg?d.msg:"已导入"); if(d&&d.ok){$("ruleText").value="";loadRules();loadStatus();} this.disabled=false; });
 });
 
-// ---- 初始化 ----
 initTheme();
 loadStatus(); loadLog(); loadMetrics(); loadRules(); loadAutostart();
 setInterval(()=>{loadStatus();loadLog();}, 1500);
-setInterval(()=>{loadMetrics();}, 2000);
+setInterval(loadMetrics, 3000);
 </script>
 </body>
 </html>
