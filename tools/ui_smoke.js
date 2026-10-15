@@ -40,14 +40,25 @@ setTimeout(() => {
   ok(d.querySelectorAll("#segRoute .segbtn").length === 2, "分路切换 2 项");
   ok(d.querySelectorAll(".settings .row").length >= 7, "设置项 >= 7");
 
+  console.log("== 出口拓扑 ==");
+  ok(!!$("topoSvg"), "拓扑 SVG 存在");
+  ok(d.querySelectorAll(".topo-node").length === 4, "拓扑节点 4 个 (本机/引擎/直连/WARP)");
+  ok(d.querySelectorAll(".topo-epath").length === 3, "拓扑连线 3 条");
+  ok(d.querySelectorAll(".topo-pt").length === 9, "流动粒子 9 个 (每边 3)");
+  ok(!!$("topoDetail") && !!$("topoChips"), "详情面板与数据条存在");
+  ok(d.querySelector(".topo-node.sel") && d.querySelector(".topo-node.sel").dataset.node === "engine", "默认选中分流引擎");
+  const warp = d.querySelector('[data-node="warp"]');
+  ok(warp && warp.querySelectorAll("text").length >= 4, "WARP 节点 >=4 行数据");
+
   console.log("== 样式 ==");
-  const cs = dom.window.getComputedStyle(d.body);
-  ok(/rgb\(10, 14, 20\)|#0a0e14/.test(cs.backgroundColor), "暗色底 " + cs.backgroundColor);
-  const card0 = cards[0] ? dom.window.getComputedStyle(cards[0]) : null;
-  ok(card0 && parseInt(card0.borderRadius) >= 12, "卡片圆角 " + (card0 && card0.borderRadius));
+  // 注意: jsdom 的 getComputedStyle 不解析 var(), 新版直接返回字面量,
+  // 所以这里校验原始 CSS 文本(变量定义 / 关键声明), 不做计算样式断言。
+  const css = d.querySelector("style").textContent;
+  ok(/--bg:\s*#0a0e14/.test(css), "暗色底变量定义");
+  ok(/\.card\{[\s\S]*?border-radius:\s*var\(--r\)/.test(css), "卡片圆角 var(--r)");
+  ok(/body\{[\s\S]*?radial-gradient/.test(css), "顶部光晕背景");
   const tile = d.querySelector(".tile.up .n");
   ok(tile && /rgb\(167, 139, 250\)/.test(dom.window.getComputedStyle(tile).color), "在线时长磁贴配色");
-  ok(cs.backgroundImage.includes("radial-gradient"), "顶部光晕背景");
 
   console.log("== 文案 ==");
   ok($("heroHint").textContent.includes("国际流量"), "hero 副文案");

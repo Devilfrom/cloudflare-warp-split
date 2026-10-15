@@ -173,6 +173,7 @@ WORKERS = int(os.environ.get("WARP_SPLIT_WORKERS", "20"))
 MAX_RANGES = int(os.environ.get("WARP_SPLIT_MAX", "0"))
 APNIC_URL = "https://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest"
 EGRESS_SERVICES = [
+    "https://www.cloudflare.com/cdn-cgi/trace",
     "https://api.ipify.org",
     "https://myip.ipip.net",
     "https://ipinfo.io/ip",
@@ -569,7 +570,7 @@ def read_active_ranges(force=False):
     return uniq
 
 
-_egress_cache = {"ts": 0.0, "ip": ""}
+_egress_cache = {"ts": 0.0, "ip": "", "colo": "", "loc": ""}
 
 
 def get_egress_ip(ttl=25):
@@ -584,6 +585,7 @@ def get_egress_ip(ttl=25):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     res = "获取失败"
+    colo, loc = "", ""
     for url in EGRESS_SERVICES:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -593,13 +595,34 @@ def get_egress_ip(ttl=25):
                 m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", data)
                 if m:
                     res = m.group(1)
+                    # trace 接口还会返回 colo=XXX / loc=XX, 顺手解析 —— 出口
+                    # 落在哪个 Cloudflare 边缘节点对「分流到哪去了」很直观,
+                    # 而且这是同一个响应, 不增加任何请求成本。
+                    mc = re.search(r"^colo=([A-Za-z0-9]+)", data, re.M)
+                    if mc:
+                        colo = mc.group(1).upper()
+                    ml = re.search(r"^loc=([A-Za-z]{2})", data, re.M)
+                    if ml:
+                        loc = ml.group(1).upper()
                     break
         except Exception:
             continue
     if res != "获取失败":
         _egress_cache["ts"] = now
         _egress_cache["ip"] = res
+        _egress_cache["colo"] = colo
+        _egress_cache["loc"] = loc
     return res
+
+
+def get_egress_colo():
+    """当前出口的 Cloudflare 边缘节点代号(如 LAX), 与 IP 同源同缓存。"""
+    return _egress_cache.get("colo", "")
+
+
+def get_egress_loc():
+    """出口所在国家/地区代码(如 US / HK / SG), 用于出口可视化。"""
+    return _egress_cache.get("loc", "")
 
 
 def save_state():
@@ -1995,16 +2018,43 @@ def read_nic_dns(force=False):
     if not force and now - _NIC_DNS_CACHE["ts"] < _NIC_DNS_TTL:
         return _NIC_DNS_CACHE["val"]
     try:
+        # 同一次 PowerShell 调用里顺手取默认网关 —— 出口可视化要用, 不额外起进程。
         body = ("Get-DnsClientServerAddress -AddressFamily IPv4 | "
                 "Where-Object { $_.ServerAddresses.Count -gt 0 } | "
-                "ForEach-Object { $_.ServerAddresses -join ',' }")
+                "ForEach-Object { $_.ServerAddresses -join ',' }; "
+                "'GATEWAY:' + "
+                "((Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 "
+                "-ErrorAction SilentlyContinue | Select-Object -First 1).NextHop)")
         _rc, out = _ps(body, timeout=20)
-        val = [x.strip() for x in out.splitlines() if x.strip()]
+        val = []
+        for ln in (out or "").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln.upper().startswith("GATEWAY:"):
+                gw = ln.split(":", 1)[1].strip()
+                if gw and gw[0].isdigit():
+                    _GATEWAY_CACHE["val"] = gw
+                    _GATEWAY_CACHE["ts"] = now
+            else:
+                val.append(ln)
     except Exception:
         val = []
     _NIC_DNS_CACHE["ts"] = now
     _NIC_DNS_CACHE["val"] = val
     return val
+
+
+_GATEWAY_CACHE = {"ts": 0.0, "val": ""}
+
+
+def get_gateway():
+    """默认网关地址(带缓存, 与 read_nic_dns 同源)。出口可视化用。"""
+    if not _IS_WIN:
+        return ""
+    if not _GATEWAY_CACHE["val"]:
+        read_nic_dns()
+    return _GATEWAY_CACHE["val"]
 
 
 def apply_dns_fallbacks():
@@ -2388,6 +2438,94 @@ def run_guard_once():
     except Exception as e:
         log("[guard] 巡检异常: " + str(e), logging.WARNING)
         return 1
+
+
+# ====================== 出口可视化数据 ======================
+_LOCAL_IP_CACHE = {"ts": 0.0, "val": ""}
+
+
+def _cached_local_ip(ttl=300):
+    """本机内网 IP。解析一次管 5 分钟 —— gethostbyname 虽然大概率走 hosts
+    文件, 但极端情况下会走 DNS 查询, 可视化接口不该冒这个阻塞风险。"""
+    now = time.time()
+    if now - _LOCAL_IP_CACHE["ts"] < ttl:
+        return _LOCAL_IP_CACHE["val"]
+    ip = ""
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        ip = ""
+    _LOCAL_IP_CACHE["ts"] = now
+    _LOCAL_IP_CACHE["val"] = ip
+    return ip
+
+
+def topology_snapshot():
+    """出口拓扑快照: 本机 -> 分流引擎 -> 国内直连 / WARP 隧道。
+
+    **只读内存里的缓存**, 不新起任何子进程、不发任何网络请求 —— 面板上这个
+    组件是纯展示, 不能因为它拖慢 /api/status 或给 warp-cli 添负担
+    (分流性能优先)。数据新鲜度由各缓存自己的 TTL 决定(10-30 秒)。
+    """
+    with state_lock:
+        st = dict(state)
+    with metrics_lock:
+        mt = dict(metrics)
+    fb = _cached_fallback_server().replace("\n", " ").strip()
+    if fb.lower().startswith("default fallbacks:"):
+        fb = fb.split(":", 1)[1].strip()
+    ds = dns_stats
+    bs = bridge_stats
+    try:
+        local_ip = _cached_local_ip()
+    except Exception:
+        local_ip = ""
+    total_dns = (ds.get("cn", 0) or 0) + (ds.get("warp", 0) or 0)
+    return {
+        "ts": time.time(),
+        "local": {
+            "ip": local_ip,
+            "gateway": get_gateway(),
+            "nic_dns": read_nic_dns(),
+            "dns_proxy": bool(st.get("dns_proxy")),
+        },
+        "engine": {
+            "route_mode": settings.get("route_mode", "tun"),
+            "route_active": st.get("route_active"),
+            "rules": _cached_cli_count(),
+            "dns_suffixes": len(DNS_FALLBACK_SUFFIXES) if settings.get("smart_dns", True) else 0,
+            "fallback": fb,
+            "mode": _cached_mode(),
+        },
+        "direct": {
+            "label": "国内直连",
+            "latency": mt.get("latency_cn"),
+            "queries": ds.get("cn", 0) or 0,
+        },
+        "warp": {
+            "label": "WARP 隧道",
+            "connected": bool(st.get("enabled")),
+            "egress_ip": mt.get("egress_ip", ""),
+            "colo": get_egress_colo(),
+            "loc": get_egress_loc(),
+            "latency": mt.get("latency_intl"),
+            "queries": ds.get("warp", 0) or 0,
+            "socks": "127.0.0.1:%d" % int(settings.get("proxy_port", 40000)),
+            "bridge": ("127.0.0.1:%d" % int(settings.get("bridge_port", 7890))
+                       if st.get("bridge_up") else ""),
+        },
+        "traffic": {
+            "dl_mbps": mt.get("dl_speed_mbps"),
+            "uptime_s": mt.get("uptime_s", 0) or 0,
+            "bridge_direct": bs.get("direct", 0) or 0,
+            "bridge_proxy": bs.get("proxy", 0) or 0,
+            "bridge_errors": bs.get("errors", 0) or 0,
+            "dns_errors": ds.get("errors", 0) or 0,
+            "dns_total": total_dns,
+            "net_ok": bool(net_state.get("ok")),
+            "net_detail": net_state.get("detail", ""),
+        },
+    }
 
 
 # ====================== 核心操作 ======================
@@ -3939,6 +4077,13 @@ class Handler(BaseHTTPRequestHandler):
                     "uptime_s": metrics["uptime_s"],
                     "history": list(metrics_history),
                 })
+        elif p == "/api/topology":
+            # 出口拓扑快照: 纯读缓存, 零子进程零请求, 面板可视化用。
+            # 注意不要在这里调任何 warp-cli —— 那是 /api/status 的职责。
+            try:
+                self._json(topology_snapshot())
+            except Exception as e:
+                self._json({"error": str(e)})
         elif p == "/api/rules":
             avail = []
             for name in settings.get("active_lists", []):

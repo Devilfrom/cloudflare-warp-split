@@ -221,6 +221,40 @@
     .tiles{grid-template-columns:repeat(2,1fr)}
     .hero{gap:14px}
   }
+
+  /* ---------- 出口拓扑 ---------- */
+  .topo-svg{width:100%;height:auto;display:block;user-select:none}
+  .topo-node{cursor:pointer}
+  .topo-node .nbox{fill:var(--panel2);stroke:var(--border2);stroke-width:1.2;transition:stroke .2s}
+  .topo-node:hover .nbox{stroke:var(--accent2)}
+  .topo-node.sel .nbox{stroke:var(--accent);stroke-width:1.8}
+  .topo-node.off{opacity:.42}
+  .topo-t{fill:var(--txt);font-size:13px;font-weight:750}
+  .topo-s{fill:var(--sub);font-size:10.5px}
+  .topo-s.mono{fill:var(--mono);font-weight:600}
+  .topo-el{fill:var(--sub2);font-size:10px;font-weight:600;text-anchor:middle}
+  .topo-epath{fill:none;stroke-width:1.8;opacity:.4;transition:opacity .3s}
+  .topo-epath.e1{stroke:var(--border2)}
+  .topo-epath.e2{stroke:var(--green)}
+  .topo-epath.e3{stroke:var(--amber)}
+  .topo-epath.dim{opacity:.08}
+  .topo-pt{pointer-events:none}
+  /* 粒子/状态点颜色必须走 CSS 类 —— SVG presentation attribute 不支持 var() */
+  .topo-pt.p1{fill:var(--accent2)}
+  .topo-pt.p2{fill:var(--green)}
+  .topo-pt.p3{fill:var(--amber)}
+  .topo-dot{fill:var(--sub2)}
+  .topo-dot.on{fill:var(--green)}
+  .topo-detail{
+    margin-top:12px;border-top:1px dashed var(--border);padding-top:12px;
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px 18px;
+  }
+  .topo-detail .kv{align-items:baseline}
+  .topo-detail .kv .k{font-size:11.5px;color:var(--sub)}
+  .topo-detail .kv .val{font-size:12px}
+  .topo-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  .topo-chips .chip{font-size:11px}
+  .topo-chips .chip b{color:var(--txt)}
 </style>
 </head>
 <body>
@@ -274,6 +308,64 @@
     <div class="tile intl"><div class="n" id="mIntl">—</div><div class="l">国际延迟 (ms)</div></div>
     <div class="tile spd"><div class="n" id="mSpd">—</div><div class="l">下载速率 (Mbps)</div></div>
     <div class="tile up"><div class="n" id="mUp">—</div><div class="l">在线时长</div></div>
+  </div>
+
+  <!-- 出口拓扑: 本机 -> 分流引擎 -> 国内直连 / WARP 隧道 -->
+  <div class="card full">
+    <h2>出口拓扑 <span class="hint">粒子流速随延迟变化 · 密度随查询量变化 · 点击节点查看详情</span></h2>
+    <svg id="topoSvg" class="topo-svg" viewBox="0 0 680 292" role="img" aria-label="网络出口拓扑图">
+      <!-- 连线 -->
+      <path id="topoE3" class="topo-epath e3" data-edge="e3" d="M418 164 C452 164 470 234 504 234"></path>
+      <path id="topoE1" class="topo-epath e1" data-edge="e1" d="M176 150 H262"></path>
+      <path id="topoE2" class="topo-epath e2" data-edge="e2" d="M418 136 C452 136 470 76 504 76"></path>
+      <text class="topo-el" x="219" y="141" id="topoL1">系统流量</text>
+      <text class="topo-el" x="450" y="94" id="topoL2">国内 CIDR</text>
+      <text class="topo-el" x="464" y="222" id="topoL3">境外默认</text>
+      <!-- 流动粒子 -->
+      <g id="topoPts">
+        <circle class="topo-pt p1" r="3" opacity="0"></circle>
+        <circle class="topo-pt p1" r="3" opacity="0"></circle>
+        <circle class="topo-pt p1" r="3" opacity="0"></circle>
+        <circle class="topo-pt p2" r="2.6" opacity="0"></circle>
+        <circle class="topo-pt p2" r="2.6" opacity="0"></circle>
+        <circle class="topo-pt p2" r="2.6" opacity="0"></circle>
+        <circle class="topo-pt p3" r="2.6" opacity="0"></circle>
+        <circle class="topo-pt p3" r="2.6" opacity="0"></circle>
+        <circle class="topo-pt p3" r="2.6" opacity="0"></circle>
+      </g>
+      <!-- 本机 -->
+      <g class="topo-node" data-node="local">
+        <rect class="nbox" x="20" y="113" width="156" height="74" rx="13"></rect>
+        <text class="topo-t" x="34" y="137">本机</text>
+        <text class="topo-s mono" x="34" y="157" id="topoLocalIp">—</text>
+        <text class="topo-s" x="34" y="173" id="topoLocalGw">—</text>
+      </g>
+      <!-- 分流引擎 -->
+      <g class="topo-node sel" data-node="engine">
+        <rect class="nbox" x="262" y="113" width="156" height="74" rx="13"></rect>
+        <text class="topo-t" x="276" y="137">分流引擎</text>
+        <text class="topo-s mono" x="276" y="157" id="topoEngInfo">—</text>
+        <text class="topo-s" x="276" y="173" id="topoEngFb">—</text>
+      </g>
+      <!-- 国内直连 -->
+      <g class="topo-node" data-node="direct">
+        <rect class="nbox" x="504" y="44" width="156" height="64" rx="13"></rect>
+        <text class="topo-t" x="518" y="68">国内直连</text>
+        <text class="topo-s mono" x="518" y="87" id="topoDirLat">—</text>
+        <text class="topo-s" x="518" y="101" id="topoDirQ">—</text>
+      </g>
+      <!-- WARP 隧道 -->
+      <g class="topo-node" data-node="warp">
+        <rect class="nbox" x="504" y="196" width="156" height="76" rx="13"></rect>
+        <circle id="topoWarpDot" class="topo-dot" cx="642" cy="214" r="4"></circle>
+        <text class="topo-t" x="518" y="217">WARP 隧道</text>
+        <text class="topo-s mono" x="518" y="236" id="topoWarpColo">—</text>
+        <text class="topo-s mono" x="518" y="252" id="topoWarpIp">—</text>
+        <text class="topo-s" x="518" y="266" id="topoWarpStat">—</text>
+      </g>
+    </svg>
+    <div class="topo-detail" id="topoDetail"></div>
+    <div class="topo-chips" id="topoChips"></div>
   </div>
 
   <!-- 曲线 -->
@@ -903,10 +995,162 @@ $("btnImportUrl").addEventListener("click",function(){
   postJSON("/api/rules/import",{name:name,source:"url",value:text}).then(d=>{ toast(d&&d.msg?d.msg:"已导入"); if(d&&d.ok){$("ruleText").value="";loadRules();loadStatus();} this.disabled=false; });
 });
 
+// ---- 出口拓扑可视化 ----
+// 设计原则(分流性能优先):
+//   1. 只读 /api/topology —— 后端该接口纯读内存缓存, 零子进程零网络请求
+//   2. 粒子动画用 rAF + 预采样折线(纯数组运算), 不调 SVG 几何 API
+//   3. 页面隐藏时整个循环直接 return, 不做任何 DOM 写入
+//   4. 3 秒一轮, 与指标轮询错峰, 互不阻塞
+const TOPO={data:null,sel:"engine",pts:[],edges:{},samples:{},ready:false,raf:0,last:0};
+function topoSample(el,n){
+  const pts=[];
+  try{
+    const len=el.getTotalLength();
+    for(let i=0;i<=n;i++){ const p=el.getPointAtLength(len*i/n); pts.push([p.x,p.y]); }
+  }catch(e){/* jsdom 等环境无 SVG 几何实现, 退回隐藏粒子 */}
+  return pts;
+}
+function topoInit(){
+  const svg=$("topoSvg"); if(!svg||TOPO.ready) return;
+  const start={e1:0,e2:3,e3:6};
+  svg.querySelectorAll(".topo-pt").forEach((el,i)=>{
+    const edge=i<3?"e1":(i<6?"e2":"e3");
+    TOPO.pts.push({el:el,edge:edge,idx:i-start[edge],t:(i-start[edge])/3});
+  });
+  for(const k of ["e1","e2","e3"]){
+    const p=$("topoE"+k[1]);
+    TOPO.samples[k]=p?topoSample(p,48):[];
+  }
+  TOPO.edges={e1:{on:true,speed:0.14,count:2},
+              e2:{on:false,speed:0.10,count:1},
+              e3:{on:false,speed:0.10,count:1}};
+  svg.querySelectorAll(".topo-node").forEach(g=>{
+    g.addEventListener("click",()=>topoSelect(g.dataset.node));
+  });
+  topoSelect("engine");
+  TOPO.ready=true;
+  TOPO.raf=requestAnimationFrame(topoLoop);
+}
+function topoSpeed(lat){
+  if(lat==null||lat<=0) return 0.09;
+  return Math.max(0.2,Math.min(45/lat,1.6))*0.13;
+}
+function topoLoop(now){
+  TOPO.raf=requestAnimationFrame(topoLoop);
+  if(document.hidden||!TOPO.ready||!TOPO.data) return;
+  const dt=Math.min((now-(TOPO.last||now))/1000,0.12); TOPO.last=now;
+  for(const pt of TOPO.pts){
+    const e=TOPO.edges[pt.edge];
+    const on=e&&e.on&&pt.idx<e.count&&TOPO.samples[pt.edge].length>0;
+    if(!on){ pt.el.setAttribute("opacity","0"); continue; }
+    pt.t+=e.speed*dt; if(pt.t>=1) pt.t-=1;
+    const s=TOPO.samples[pt.edge], f=pt.t*(s.length-1), i=Math.floor(f);
+    const a=s[i], b=s[Math.min(i+1,s.length-1)], k=f-i;
+    pt.el.setAttribute("cx",(a[0]+(b[0]-a[0])*k).toFixed(1));
+    pt.el.setAttribute("cy",(a[1]+(b[1]-a[1])*k).toFixed(1));
+    pt.el.setAttribute("opacity","0.95");
+  }
+}
+function topoSelect(id){
+  TOPO.sel=id;
+  document.querySelectorAll(".topo-node").forEach(g=>g.classList.toggle("sel",g.dataset.node===id));
+  topoDetail();
+}
+function topoEsc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
+function topoKv(k,v){ return '<div class="kv"><span class="k">'+k+'</span><span class="val">'+topoEsc(v)+'</span></div>'; }
+function topoFmtN(n){ n=n||0; return n>=10000?(n/1000).toFixed(1)+"k":String(n); }
+function topoDur(s){
+  if(!s||s<1) return "—";
+  const h=Math.floor(s/3600),m=Math.floor(s%3600/60);
+  return h>0?h+" 时 "+m+" 分":m+" 分 "+(s%60)+" 秒";
+}
+function topoDetail(){
+  const el=$("topoDetail"); if(!el) return;
+  const d=TOPO.data;
+  const L=(d&&d.local)||{},E=(d&&d.engine)||{},D=(d&&d.direct)||{},W=(d&&d.warp)||{};
+  let rows=[];
+  if(TOPO.sel==="local"){
+    rows=[topoKv("内网 IP",L.ip||"—"),topoKv("默认网关",L.gateway||"—"),
+      topoKv("网卡 DNS",(L.nic_dns||[]).join(" , ")||"—"),
+      topoKv("DNS 代理",L.dns_proxy?"运行中":"未开启")];
+  }else if(TOPO.sel==="engine"){
+    rows=[topoKv("分路模式",E.route_mode==="proxy"?"Proxy 分路（仅代理应用）":"TUN 全局（接管系统路由）"),
+      topoKv("路由状态",E.route_active?"生效中":"未生效"),
+      topoKv("分流规则",(E.rules||0)+" 条"),
+      topoKv("DNS 后缀",(E.dns_suffixes||0)+" 条"),
+      topoKv("fallback 服务器",E.fallback||"—"),
+      topoKv("WARP 模式",E.mode||"—")];
+  }else if(TOPO.sel==="direct"){
+    rows=[topoKv("延迟",D.latency!=null?D.latency+" ms":"—"),
+      topoKv("DNS 查询",(D.queries||0)+" 次"),
+      topoKv("说明","国内 CDN / 网站直连，首包最快")];
+  }else{
+    rows=[topoKv("连接状态",W.connected?"已连接":"未连接"),
+      topoKv("出口 IP",W.egress_ip||"—"),
+      topoKv("边缘节点",W.colo||"—"),
+      topoKv("归属地区",W.loc||"—"),
+      topoKv("延迟",W.latency!=null?W.latency+" ms":"—"),
+      topoKv("DNS 查询",(W.queries||0)+" 次"),
+      topoKv("SOCKS5",W.socks||"—"),
+      topoKv("分流桥",W.bridge||"未启动")];
+  }
+  el.innerHTML=rows.join("");
+}
+function topoRender(d){
+  if(!d||d.error) return;
+  TOPO.data=d;
+  const L=d.local||{},E=d.engine||{},D=d.direct||{},W=d.warp||{},T=d.traffic||{};
+  const proxy=E.route_mode==="proxy";
+  // 节点文本
+  $("topoLocalIp").textContent=L.ip||"—";
+  $("topoLocalGw").textContent="网关 "+(L.gateway||"—");
+  $("topoEngInfo").textContent=(E.rules||0)+" 规则 · "+(E.dns_suffixes||0)+" 后缀";
+  $("topoEngFb").textContent="fallback "+(E.fallback?E.fallback.slice(0,18):"—");
+  $("topoDirLat").textContent=D.latency!=null?D.latency+" ms":"—";
+  $("topoDirQ").textContent="DNS "+topoFmtN(D.queries)+" 次";
+  const wg=document.querySelector('[data-node="warp"]');
+  if(wg) wg.classList.toggle("off",!W.connected);
+  $("topoWarpDot").classList.toggle("on",!!W.connected);
+  $("topoWarpColo").textContent=W.connected?((W.colo||"—")+(W.loc?" · "+W.loc:"")):"未连接";
+  $("topoWarpIp").textContent=W.connected?(W.egress_ip||"—"):"—";
+  $("topoWarpStat").textContent=W.connected
+    ?((W.latency!=null?W.latency+" ms":"—")+" · DNS "+topoFmtN(W.queries)):"—";
+  // 连线标签随分路模式变化
+  $("topoL1").textContent=proxy?"本机应用":"系统流量";
+  $("topoL2").textContent=proxy?"应用分流":"国内 CIDR";
+  $("topoL3").textContent=proxy?("SOCKS5 "+(W.socks||"").split(":")[1]||""):"境外默认";
+  // 粒子: 活跃度 + 速度 + 密度
+  const tot=(D.queries||0)+(W.queries||0);
+  let cD=1,cW=1;
+  if(tot>0){ cD=1+Math.round((D.queries/tot)*2); cW=1+Math.round((W.queries/tot)*2); }
+  TOPO.edges.e2.on=true;  TOPO.edges.e2.speed=topoSpeed(D.latency); TOPO.edges.e2.count=cD;
+  TOPO.edges.e3.on=!!W.connected; TOPO.edges.e3.speed=topoSpeed(W.latency); TOPO.edges.e3.count=W.connected?cW:0;
+  TOPO.edges.e1.count=tot>500?3:2;
+  $("topoE3").classList.toggle("dim",!W.connected);
+  topoDetail();
+  // 底部数据条
+  const chips=[];
+  chips.push('<span class="chip"><span class="d" style="background:'+(T.net_ok?"var(--green)":"var(--red)")+'"></span>联网 '+(T.net_ok?"正常":"异常")+(T.net_detail?"（"+topoEsc(T.net_detail)+"）":"")+'</span>');
+  chips.push('<span class="chip">桥接 <b>'+(T.bridge_direct||0)+'</b> 直连 · <b>'+(T.bridge_proxy||0)+'</b> 代理 · <b>'+(T.bridge_errors||0)+'</b> 错误</span>');
+  chips.push('<span class="chip">DNS <b>'+topoFmtN(T.dns_total)+'</b> 查询 · <b>'+(T.dns_errors||0)+'</b> 失败</span>');
+  chips.push('<span class="chip">下载 <b>'+(T.dl_mbps!=null?T.dl_mbps:"—")+'</b> Mbps</span>');
+  chips.push('<span class="chip">在线 <b>'+topoDur(T.uptime_s)+'</b></span>');
+  $("topoChips").innerHTML=chips.join("");
+}
+function loadTopology(){
+  if(document.hidden) return;   // 隐藏页面不轮询, 省电也省后台线程
+  fetch("/api/topology").then(r=>r.json()).then(d=>topoRender(d)).catch(()=>{});
+}
+document.addEventListener("visibilitychange",()=>{
+  if(!document.hidden){ TOPO.last=0; loadTopology(); }
+});
+
 initTheme();
 loadStatus(); loadLog(); loadMetrics(); loadRules(); loadAutostart();
+topoInit(); loadTopology();
 setInterval(()=>{loadStatus();loadLog();}, 1500);
 setInterval(loadMetrics, 3000);
+setInterval(loadTopology, 3000);
 </script>
 </body>
 </html>
