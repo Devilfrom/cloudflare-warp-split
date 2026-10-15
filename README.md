@@ -68,6 +68,10 @@
 
 - 官网入口：<https://one.one.one.one/> → 点击 **Download for Windows**
 - 或 Cloudflare 产品页：<https://www.cloudflare.com/products/warp/>
+- **官方直链（GA 稳定版，x64）**：<https://downloads.cloudflareclient.com/v1/download/windows/ga>
+
+> 本仓库的 **GitHub Release** 附件里也附了一份安装包镜像，方便网络受限时
+> 直接取用。但仍建议优先走官方渠道，并以官方校验值为准。
 
 > 安装后默认路径为 `C:\Program Files\Cloudflare\Cloudflare WARP\`，包含：
 > - `Cloudflare WARP.exe`（图形客户端）
@@ -114,17 +118,33 @@ warp-cli connect
 
 ## 五、快速开始
 
+两种方式，**任选其一**：
+
+### 方式 A：免打包（推荐先用这个）
+
 1. **双击 `run.bat`**（弹出 UAC 用户账户控制时点击「是」允许提权）。
 2. 脚本会自动启动本地服务，并在浏览器打开控制台：
    ```
    http://127.0.0.1:8777/
    ```
-3. 点击控制台中间的**大开关 → 启用**：
-   - 先连接 WARP 隧道（约 6–30 秒，偶发卡顿时自动重试）；
-   - 再并发注入中国大陆 IP 规则（约 5400 条，1–2 分钟，带进度条）。
-4. 启用完成后状态变为 **「分流中」**，点 **「分流自检」** 查看验证结果。
 
-> ⚠️ 注意：**必须用 `run.bat` 启动**，不要直接双击 `index.html`。
+### 方式 B：打包好的 exe（给别人用时方便）
+
+1. 先生成一次 exe：双击 **`build.bat`**（会自动装 PyInstaller、自动提取官方图标）。
+2. 之后双击根目录生成的 **`WARP-Split-Console.exe`** 即可，无需 Python 环境。
+
+> exe 必须与 `index.html`、`china_cidr.txt` 放在**同一目录**，
+> 否则找不到控制台页面和规则库。
+
+### 启用分流
+
+点击控制台中间的**大开关 → 启用**：
+- 先连接 WARP 隧道（约 6–30 秒，偶发卡顿时自动重试）；
+- 再并发注入中国大陆 IP 规则（约 5400 条，1–4 分钟，带进度条）。
+
+启用完成后状态变为 **「分流中」**，点 **「分流自检」** 查看验证结果。
+
+> ⚠️ 注意：**必须通过 `run.bat` 或 exe 启动**，不要直接双击 `index.html`。
 > 直接以 `file://` 打开页面会导致前端连不上本地服务，点击按钮报「请求失败」。
 
 ---
@@ -212,7 +232,85 @@ warp-cli connect
 
 ---
 
-## 七、常见问题（FAQ）
+## 七、安卓端（手机）
+
+手机端**不需要本工具**：安卓版 WARP（1.1.1.1 App）自带分流能力，
+在 App 内配置即可达成「国内直连、国外走 WARP」。
+
+### 方案 A：排除国内应用（零门槛，推荐）
+
+适合绝大多数人——把常用的国内 App 排除出隧道，它们的流量直连，
+其余（浏览器、YouTube、X、Telegram 等）走 WARP。
+
+1. 打开 **1.1.1.1** App
+2. 右上角 **菜单（≡ 或 ⚙）→ 高级 → 连接选项**
+3. 找到 **排除网络流量 / Exclude Network Traffic**
+4. 选择 **应用（Apps）**，勾选你要直连的国内 App
+
+> 菜单名称会随版本变化，找不到时用 App 内搜索找 "Exclude"。
+
+常用国内应用包名（供核对，避免勾错）：
+
+| 应用 | 包名 |
+|---|---|
+| 微信 | `com.tencent.mm` |
+| QQ | `com.tencent.mobileqq` |
+| 支付宝 | `com.eg.android.AlipayGphone` |
+| 淘宝 | `com.taobao.taobao` |
+| 天猫 | `com.tmall.wireless` |
+| 京东 | `com.jingdong.app.mall` |
+| 拼多多 | `com.xunmeng.pinduoduo` |
+| 抖音 | `com.ss.android.ugc.aweme` |
+| 快手 | `com.smile.gifmaker` |
+| 哔哩哔哩 | `tv.danmaku.bili` |
+| 高德地图 | `com.autonavi.minimap` |
+| 百度地图 | `com.baidu.BaiduMap` |
+| 美团 | `com.sankuai.meituan` |
+| 饿了么 | `me.ele` |
+| 12306 | `com.MobileTicket` |
+| 网易云音乐 | `com.netease.cloudmusic` |
+| 工商银行 | `com.icbc` |
+| 招商银行 | `cmb.pb` |
+
+### 方案 B：按 IP 段精确分流（与 Windows 行为一致）
+
+安卓版 WARP 里有 **Split Tunnel Routes** 界面，可像桌面端
+`warp-cli tunnel ip add-range` 那样按 CIDR 排除。
+
+- 入口同样在 **高级 → 连接选项** 附近
+- 该能力在 **Zero Trust（团队）模式**下最完整；消费版随版本而定，可能不显示
+
+> ⚠️ 完整规则库有 5400+ 条，**不适合逐条手输**。若要在安卓上做 IP 级分流，
+> 建议走 Cloudflare Zero Trust 后台统一配置策略，设备登录团队后自动下发，
+> 不必在手机上逐条录入。
+
+### 关于安卓安装包：为什么不能只给 base.apk
+
+Google Play 分发的是 **App Bundle（AAB）**，安装到手机后会被拆成多个文件：
+
+```
+base.apk                    <- 代码与资源
+split_config.arm64_v8a.apk  <- 各 CPU 架构的 native .so（boringtun）
+split_config.zh.apk         <- 语言资源
+split_config.xxxhdpi.apk    <- 分辨率资源
+```
+
+WARP 的 WireGuard 实现 **boringtun** 是 Rust 编写的 native 库，
+位于 ABI 分包中。**只装 base.apk 会缺 .so，表现为能装但建不了隧道 /
+一开就断。** 因此要么整包导出，要么直接从官方渠道安装。
+
+仓库提供了导出脚本（手机开启 USB 调试并连线后运行）：
+
+```powershell
+python tools\export_android_app.py
+```
+
+它会 `adb pull` 全部分包到 `dist/android/`，打包成 `.apkm`
+（用 **SAI** 或 **APKMirror Installer** 安装），并校验是否含 `lib/*.so`。
+
+---
+
+## 八、常见问题（FAQ）
 
 ### Q1. 点启用报 `Connecting ... happy eyeballs ...` 卡住 / 启用失败
 这是 WARP 守护进程在同时探测 IPv4 / IPv6 端点，IPv6 探测卡住导致握手完不成。
@@ -262,7 +360,7 @@ split-tunnel 排除可能被策略禁止。请改用团队后台的 Device Profi
 
 ---
 
-## 八、技术细节
+## 九、技术细节
 
 - **后端** `warp_split.py`：纯 Python 标准库实现的 HTTP 服务（端口 `8777`）。
   - 启用流程：`disconnect → mode warp → connect（含重试 / 服务重启兜底）→ 并发 add-range 注入 china_cidr.txt`。
@@ -294,26 +392,33 @@ split-tunnel 排除可能被策略禁止。请改用团队后台的 Device Profi
 
 ---
 
-## 九、文件结构
+## 十、文件结构
 
 ```
 Cloudflare WARP/
-├── run.bat            # 启动器：自动提权 + 打开控制台
-├── warp_split.py      # 后端（Python 标准库）
-├── index.html         # 可视化控制台
-├── china_cidr.txt     # 中国大陆 IPv4 规则库（APNIC 生成）
-├── README.md          # 本文档
-├── .gitignore         # 忽略运行时产物与本机配置
-├── settings.json      # 本机设置：主题/各开关（自动生成，已忽略）
-├── rules/             # 自定义规则列表（自动生成，已忽略）
-├── state.json         # 运行时状态（自动生成，已忽略）
-├── warp_split.log     # 运行日志（自动生成，已忽略）
-└── __pycache__/       # Python 缓存（已忽略）
+├── run.bat                  # 启动器：自动提权 + 打开控制台
+├── build.bat                # 打包器：生成独立 exe（PyInstaller）
+├── WARP-Split-Console.exe   # 打包产物（双击即可用，无需 Python）
+├── warp_split.py            # 后端（Python 标准库）
+├── index.html               # 可视化控制台
+├── china_cidr.txt           # 中国大陆 IPv4 规则库（APNIC 生成）
+├── WARP-Split-Console.spec  # PyInstaller 构建配置
+├── tools/
+│   ├── make_icon.py         # 从 WARP.exe 提取官方图标
+│   ├── export_android_app.py# 从手机导出完整安卓安装包
+│   └── warp.ico             # 生成的图标（8 个尺寸）
+├── README.md                # 本文档
+├── .gitignore               # 忽略运行时产物与本机配置
+├── settings.json            # 本机设置：主题/各开关（自动生成，已忽略）
+├── rules/                   # 自定义规则列表（自动生成，已忽略）
+├── state.json               # 运行时状态（自动生成，已忽略）
+├── warp_split.log           # 运行日志（自动生成，已忽略）
+└── __pycache__/             # Python 缓存（已忽略）
 ```
 
 ---
 
-## 十、安全与隐私
+## 十一、安全与隐私
 
 - 所有流量策略都由你本机的 `warp-cli` 执行，**不会上传任何数据到第三方**。
 - 国际流量经 Cloudflare WARP 出口，出口 IP 属于 Cloudflare，属正常 VPN / 隧道行为。
@@ -322,7 +427,7 @@ Cloudflare WARP/
 
 ---
 
-## 十一、卸载
+## 十二、卸载
 
 1. 控制台点「一键还原」确保网络干净；
 2. 关闭 `run.bat` 打开的页面与后台服务（任务管理器结束 `python.exe` 进程，或 `netstat` 找到 8777 端口进程结束）；
@@ -331,7 +436,7 @@ Cloudflare WARP/
 
 ---
 
-## 十二、许可证与免责声明
+## 十三、许可证与免责声明
 
 - 本项目以 **MIT 许可证** 开源。
 - Cloudflare WARP 相关商标与软件版权归 Cloudflare, Inc. 所有；本工具仅作技术集成与自动化封装，与 Cloudflare 无隶属关系。
@@ -339,6 +444,6 @@ Cloudflare WARP/
 
 ---
 
-## 十三、贡献
+## 十四、贡献
 
 欢迎提 Issue / PR。仓库地址（示例）：<https://github.com/Devilfrom/cloudflare-warp-split>
