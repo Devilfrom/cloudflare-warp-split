@@ -1610,19 +1610,47 @@ server = None
 
 
 # ====================== 提权 ======================
+# 提权重启时附加此标记。若带标记启动后仍非管理员, 说明 UAC 被禁用或弹窗
+# 被拒绝, 此时必须停止重试——否则会陷入「启动 -> 检测非管理员 -> 再启动」
+# 的死循环, 表现为不停弹出/闪烁控制台窗口。
+ELEVATED_FLAG = "--elevated"
+
+_shell_execute = ctypes.windll.shell32.ShellExecuteW
+_shell_execute.restype = ctypes.wintypes.HINSTANCE
+_shell_execute.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.LPCWSTR,
+                           ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR,
+                           ctypes.wintypes.LPCWSTR, ctypes.c_int]
+
+
 def is_admin():
     try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return True
 
 
 def run_as_admin():
+    """以管理员权限重启自身。返回 True 表示提权请求已成功发出。
+
+    必须校验 ShellExecute 返回值: 返回值 <= 32 代表失败(UAC 弹窗被取消、
+    UAC 被组策略禁用等)。若不加判断, 主流程会误以为已提权而直接退出,
+    而子进程又因仍是普通权限再次走提权分支, 形成无限重启。
+    """
+    args = [a for a in sys.argv[1:] if a != ELEVATED_FLAG]
+    parts = ['"%s"' % sys.executable] + ['"%s"' % a for a in args] + [ELEVATED_FLAG]
+    params = " ".join(parts)
     try:
-        params = " ".join([repr(a) for a in sys.argv])
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        r = _shell_execute(None, "runas", sys.executable, params, None, 1)
     except Exception as e:
-        log("提权失败: " + str(e), logging.ERROR)
+        log("提权异常: " + str(e), logging.ERROR)
+        return False
+
+    if r is None or int(r) <= 32:
+        log(f"提权失败 (ShellExecute 返回 {r})。通常是 UAC 弹窗被取消, "
+            f"或系统禁用了 UAC。请右键程序 →「以管理员身份运行」。",
+            logging.ERROR)
+        return False
+    return True
 
 
 # ====================== 主函数 ======================
@@ -1632,9 +1660,22 @@ def main():
     load_settings()
     load_state()
     if not is_admin():
+        if ELEVATED_FLAG in sys.argv:
+            # 已经提权重启过一次, 却仍不是管理员 —— 继续重试只会导致
+            # 无限弹窗。这里明确报错并退出, 由用户手动以管理员运行。
+            log("提权后仍非管理员权限。可能系统禁用了 UAC(账户控制), "
+                "或提权请求被安全软件拦截。", logging.ERROR)
+            log("请右键本程序 →「以管理员身份运行」; "
+                "或在「设置 → 账户 → 用户账户控制」中把 UAC 调回默认级别。",
+                logging.ERROR)
+            pause()
+            sys.exit(1)
+
         log("当前非管理员, 尝试提权...")
-        run_as_admin()
-        sys.exit(0)
+        if run_as_admin():
+            sys.exit(0)
+        pause()
+        sys.exit(1)
 
     tray_mode = settings.get("tray", True) and "--no-tray" not in sys.argv
 
