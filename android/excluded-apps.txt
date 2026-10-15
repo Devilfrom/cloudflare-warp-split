@@ -1,0 +1,89 @@
+# Cloudflare WARP (1.1.1.1) for Android - 建议排除直连的国内应用包名
+#
+# 用法: 在 1.1.1.1 App 的「排除应用 / Manage excluded apps」里按包名核对勾选,
+#       被勾选的 App 流量不走 WARP 隧道, 直连国内网络; 未勾选的走 WARP。
+# 路径: Settings(⚙) -> Advanced -> Connection options -> Manage excluded apps
+# 格式: 每行一个包名, "#" 开头为注释。包名区分大小写。
+
+# ---------- 社交通讯 ----------
+com.tencent.mm                 # 微信
+com.tencent.mobileqq           # QQ
+com.tencent.wework             # 企业微信
+com.sina.weibo                 # 微博
+com.xingin.xhs                 # 小红书
+com.tencent.tim                # TIM
+com.alibaba.android.rimet      # 钉钉
+
+# ---------- 支付 / 金融 ----------
+com.eg.android.AlipayGphone    # 支付宝
+com.unionpay                   # 云闪付
+com.icbc                       # 中国工商银行
+cmb.pb                         # 招商银行
+com.chinamworld.main           # 中国建设银行
+com.bankcomm.Bankcomm          # 交通银行
+com.rytongye.sdb               # 平安银行
+
+# ---------- 电商购物 ----------
+com.taobao.taobao              # 淘宝
+com.tmall.wireless             # 天猫
+com.jingdong.app.mall          # 京东
+com.xunmeng.pinduoduo          # 拼多多
+com.sankuai.meituan            # 美团
+me.ele                         # 饿了么
+com.jingdong.pdj               # 京喜
+
+# ---------- 长视频 / 短视频 ----------
+com.ss.android.ugc.aweme       # 抖音
+com.smile.gifmaker             # 快手
+tv.danmaku.bili                # 哔哩哔哩
+com.tencent.qqlive             # 腾讯视频
+com.qiyi.video                 # 爱奇艺
+com.youku.phone                # 优酷
+com.ss.android.ugc.live        # 抖音火山版
+
+# ---------- 音乐 ----------
+com.netease.cloudmusic         # 网易云音乐
+com.kugou.android              # 酷狗音乐
+cn.kuwo.player                 # 酷我音乐
+com.tencent.qqmusic            # QQ音乐
+
+# ---------- 出行 / 导航 ----------
+com.autonavi.minimap           # 高德地图
+com.baidu.BaiduMap             # 百度地图
+com.sdu.didi.psnger            # 滴滴出行
+com.MobileTicket               # 铁路 12306
+ctrip.android.view             # 携程旅行
+com.Qunar                      # 去哪儿旅行
+
+# ---------- 工具 / 办公 / 网盘 ----------
+com.baidu.netdisk              # 百度网盘
+com.tencent.mobileqq           # (QQ 已列于社交通讯)
+com.taobao.taobao              # (淘宝 已列于电商)
+com.wps.moffice_eng            # WPS Office
+com.tencent.docs               # 腾讯文档
+com.alibaba.android.wireless    # 阿里巴巴
+
+# ---------- 生活服务 ----------
+com.sankuai.meituan            # (美团 已列于电商)
+com.dianping.v1                # 大众点评
+com.ganji.android.hi           # 58同城
+com.zhihu.android              # 知乎
+com.ss.android.article.news    # 今日头条
+
+
+# ---------------------------------------------------------------------------
+# 说明
+#
+# 1. 勾选「排除」的应用走直连, 其余走 WARP。若想反过来(只有少数应用走 WARP),
+#    部分版本支持 Include 模式, 在 Split Tunnels 里切换。
+#
+# 2. 银行/支付类 App 建议一律排除: 走境外出口容易触发风控或验证码。
+#
+# 3. Android Auto、无线投屏、局域网设备(NAS/摄像头/打印机)相关 App 建议排除,
+#    否则会连不上 —— 这是社区反馈最多的问题。
+#
+# 4. 包名会随版本变化, 以手机上「设置 → 应用管理」里显示的为准。
+#
+# 5. 新版 One Agent App 可能没有「排除应用」入口(Cloudflare 2025 年调整),
+#    此时只能用「排除路由(Manage excluded routes)」按 IP 段分流。
+# ---------------------------------------------------------------------------

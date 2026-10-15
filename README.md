@@ -237,6 +237,9 @@ warp-cli connect
 手机端**不需要本工具**：安卓版 WARP（1.1.1.1 App）自带分流能力，
 在 App 内配置即可达成「国内直连、国外走 WARP」。
 
+> 📱 **完整图文步骤、排除应用清单、可导入的网段文件见
+> [`android/README.md`](android/README.md)。** 本章为要点概述。
+
 ### 方案 A：排除国内应用（零门槛，推荐）
 
 适合绝大多数人——把常用的国内 App 排除出隧道，它们的流量直连，
@@ -407,6 +410,10 @@ Cloudflare WARP/
 │   ├── make_icon.py         # 从 WARP.exe 提取官方图标
 │   ├── export_android_app.py# 从手机导出完整安卓安装包
 │   └── warp.ico             # 生成的图标（8 个尺寸）
+├── android/
+│   ├── README.md            # 安卓端配置指南（图文步骤）
+│   ├── excluded-apps.txt    # 国内应用包名清单
+│   └── china-routes-lite.txt# 精简网段规则（1849 条，手机导入用）
 ├── README.md                # 本文档
 ├── .gitignore               # 忽略运行时产物与本机配置
 ├── settings.json            # 本机设置：主题/各开关（自动生成，已忽略）
