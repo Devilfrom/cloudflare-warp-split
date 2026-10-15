@@ -216,6 +216,8 @@ state = {
     "bridge_up": False,       # 本地分流桥是否在监听
     "sysproxy_on": False,     # 是否已写入 Windows 系统代理
     "dns_proxy": False,       # 本地智能 DNS 分流是否在接管网卡 DNS
+    "net_down": False,        # 网络保障看门狗: 当前是否探测到上不了网
+    "rescue": None,           # 最近一次自动/手动急救的详情(供控制台展示)
 }
 state_lock = threading.Lock()
 op_stop = threading.Event()
@@ -241,6 +243,9 @@ settings = {
     "_sysproxy_backup": None,     # 系统代理原值备份, 用于精确还原
     # ---- 智能 DNS 分流(决定国内站能否跑满带宽, 默认开) ----
     "smart_dns": True,            # 用本地 DNS 代理按域名分流解析
+    # ---- 网络保障(底线: 任何时候都要能上网) ----
+    "net_guard": True,            # 程序运行时的网络看门狗: 连续探测失败就自动退让
+    "net_watchdog": True,         # 系统级兜底任务: 程序没运行时也能兜住 DNS 残留
 }
 
 # 指标 (内存态, 不持久化)
@@ -2057,6 +2062,268 @@ def dns_guard_loop():
             log("dns guard err: " + str(e), logging.WARNING)
 
 
+# ====================== 网络保障: 底线是「任何时候都要能上网」 ======================
+# 分流是锦上添花, 上网才是刚需。前面所有功能都在「网络可用」这个前提上叠,
+# 而 DNS 接管、WARP 隧道、排除规则任何一环出岔子都可能把前提弄丢。
+# 这一层不关心分流是否启用 —— 它只关心一件事: 现在能不能上网? 不能就逐级
+# 退让, 直到能为止。
+NET_PROBES = ("www.baidu.com", "www.qq.com", "one.one.one.one")
+GUARD_TASK = "CloudflareWARP-Split-Guard"
+net_state = {"ok": True, "detail": "", "ts": 0.0, "streak": 0, "last_action": ""}
+
+
+def _resolve_ok(host, timeout=2.5):
+    """在限定时间内解析 host。getaddrinfo 不受 socket 超时控制(卡住能卡几十秒),
+    所以丢进线程里用 join 限时, 超时即判失败。"""
+    box = {}
+    def f():
+        try:
+            box["ok"] = bool(socket.getaddrinfo(host, 443,
+                                                proto=socket.IPPROTO_TCP))
+        except Exception:
+            box["ok"] = False
+    t = threading.Thread(target=f, daemon=True)
+    t.start()
+    t.join(timeout)
+    return bool(box.get("ok"))
+
+
+def net_ok(timeout=2.5):
+    """能否上网。只判 DNS 是否能拿到 A 记录 —— 解析不通后面的连接必然不通,
+    解析通了基本就能用, 探测成本极低(不发真实流量)。三个域名任一成功即可,
+    避免单站点故障被误判成断网。返回 (ok, detail)。"""
+    for host in NET_PROBES:
+        if _resolve_ok(host, timeout):
+            return True, host
+    return False, "解析 %s 均失败" % " / ".join(NET_PROBES)
+
+
+def rescue_network(reason=""):
+    """网络急救: 逐级退让, 每一步之后复查, 通了就停。返回 (ok, detail)。
+
+    退让顺序按「代价从小到大、可能性从高到低」排:
+      L0 还原网卡 DNS(清掉 127.0.0.1 残留) + 撤掉 WARP fallback 后缀
+         —— 覆盖 90% 的场景: 进程被硬杀后 daemon 还把查询转给死掉的本地代理
+      L1 断开 WARP 隧道 —— 回到纯直连。排除规则留在配置里, 断开后本就不生效,
+         所以这一步零副作用, 再次启用也是秒级的
+      L2 强制 netsh 清空网卡 DNS 再试 —— 到这一步基本说明不是我们造成的
+         (例如运营商/路由器问题), 如实记录并提示
+    """
+    ok, detail = net_ok()
+    if ok:
+        return True, "网络正常 (%s)" % detail
+    log("网络不可用(%s)%s, 开始急救..." % (detail, (" 触发原因: " + reason) if reason else ""),
+        logging.WARNING)
+    steps = []
+
+    # ---- L0: 撤掉我们动过的 DNS ----
+    try:
+        reset_dns_fallbacks()
+        apply_nic_dns([])
+        steps.append("已还原网卡 DNS 并撤掉 fallback 后缀")
+    except Exception as e:
+        steps.append("L0 失败: %s" % e)
+    time.sleep(1.5)
+    ok, detail = net_ok()
+    if ok:
+        _record_rescue(reason, "L0", steps, True, detail)
+        return True, "L0 还原 DNS 后恢复 (%s)" % detail
+
+    # ---- L1: 断开隧道回到直连 ----
+    try:
+        warp(["disconnect"], timeout=20)
+        steps.append("已断开 WARP 隧道(回到直连)")
+    except Exception as e:
+        steps.append("L1 失败: %s" % e)
+    time.sleep(2)
+    ok, detail = net_ok()
+    if ok:
+        _record_rescue(reason, "L1", steps, True, detail)
+        return True, "L1 断开 WARP 后恢复直连 (%s)" % detail
+
+    # ---- L2: 强制清空 DNS 再试 ----
+    try:
+        _reset_dns_via_netsh()
+        apply_nic_dns([])
+        steps.append("已用 netsh 强制清空网卡 DNS")
+    except Exception as e:
+        steps.append("L2 失败: %s" % e)
+    time.sleep(2)
+    ok, detail = net_ok()
+    _record_rescue(reason, "L2", steps, ok, detail)
+    if ok:
+        return True, "L2 强制清空 DNS 后恢复 (%s)" % detail
+    return False, ("三层急救均未恢复: %s —— 请检查路由器/运营商线路" % detail
+                   + " (" + "; ".join(steps) + ")")
+
+
+def _record_rescue(reason, level, steps, ok, detail):
+    with state_lock:
+        state["rescue"] = {
+            "ts": time.time(),
+            "reason": reason,
+            "level": level,
+            "steps": steps,
+            "ok": bool(ok),
+            "detail": detail,
+        }
+        net_state["last_action"] = ("%s 急救%s: %s" %
+                                    (level, "成功" if ok else "未恢复", detail))
+
+
+def ensure_net_ok(context=""):
+    """操作失败后的收尾检查: 确认网络真的可用, 不通就走分级急救。
+
+    启用/停用任何一步失败都可能留下「DNS 接管已写入、隧道却没连上」这类
+    半吊子状态 —— 用户看到的是"启用失败", 实际后果是"网也上不了"。
+    失败提示和"能上网"是两件事, 这里把后者兜住。
+    """
+    time.sleep(2)
+    ok, detail = net_ok()
+    if ok:
+        return True
+    log("操作后网络不可用(%s), 触发保障..." % (context or detail), logging.WARNING)
+    ok2, msg2 = rescue_network(context or detail)
+    log("保障结果: " + msg2, logging.INFO if ok2 else logging.ERROR)
+    return ok2
+
+
+def net_guard_loop():
+    """网络保障看门狗 —— 与「分流是否启用」无关, 全程在跑。
+
+    分流未启用时也要跑: 用户关了程序、程序崩了、或者残留没清干净, 都可能
+    让本机 DNS 挂掉, 而这时没有任何其他线程会去管(自愈线程只在启用后动作,
+    DNS 守卫只在智能 DNS 开着时动作)。这里是最后一道网。
+
+    判定用「连续两次失败」(约 40 秒)而不是一次: 单次的解析失败太常见
+    (瞬时抖动、DNS 服务器换手), 一次就动手会把正常网络反复拆掉。
+    """
+    time.sleep(20)          # 启动/重连期间网络在变, 先让它稳定
+    while not EXIT_EVENT.is_set():
+        EXIT_EVENT.wait(20)
+        try:
+            if state["running"]:
+                continue    # 正在启用/停用/还原, 网络正在变化, 不打扰
+
+            # Proxy 分路: 桥停了但系统代理还指着它 = 所有应用"代理错误"上不了网。
+            # 先试着把桥拉起来; 拉不起来就撤掉系统代理, 退回直连。
+            if state.get("sysproxy_on") and not port_in_use(
+                    int(settings.get("bridge_port", 7890))):
+                log("分流桥已停止但系统代理仍指向它, 正在恢复...", logging.WARNING)
+                ok_b, msg_b = start_bridge()
+                if ok_b:
+                    log("分流桥已恢复: " + msg_b)
+                else:
+                    set_system_proxy(False)
+                    with state_lock:
+                        state["sysproxy_on"] = False
+                    log("分流桥恢复失败, 已撤掉系统代理以保证正常上网: " + msg_b,
+                        logging.ERROR)
+
+            ok, detail = net_ok()
+            net_state["ok"] = ok
+            net_state["detail"] = detail
+            net_state["ts"] = time.time()
+            if ok:
+                if net_state["streak"]:
+                    log("网络已恢复正常 (%s)" % detail)
+                    with state_lock:
+                        state["net_down"] = False
+                net_state["streak"] = 0
+                continue
+            net_state["streak"] += 1
+            with state_lock:
+                state["net_down"] = True
+            if net_state["streak"] < 2:
+                log("网络探测失败 1 次 (%s), 下轮复查" % detail, logging.WARNING)
+                continue
+            if not settings.get("net_guard", True):
+                continue    # 用户关掉了自动保障
+            ok2, msg2 = rescue_network(detail)
+            net_state["streak"] = 0
+            log("自动保障结果: " + msg2, logging.INFO if ok2 else logging.ERROR)
+        except Exception as e:
+            log("net guard err: " + str(e), logging.WARNING)
+
+
+def watchdog_enabled():
+    """系统级兜底计划任务是否已注册。缓存 60 秒, 别每次 /api/status 都跑 schtasks。"""
+    now = time.time()
+    if now - _WD_CACHE["ts"] < 60:
+        return _WD_CACHE["val"]
+    _WD_CACHE["ts"] = now
+    if not _IS_WIN:
+        _WD_CACHE["val"] = False
+        return False
+    try:
+        r = _run(["schtasks", "/query", "/tn", GUARD_TASK, "/fo", "LIST"],
+                 capture_output=True, timeout=20)
+        _WD_CACHE["val"] = (r.returncode == 0)
+    except Exception:
+        _WD_CACHE["val"] = False
+    return _WD_CACHE["val"]
+
+
+_WD_CACHE = {"ts": 0, "val": False}
+
+
+def register_watchdog(minutes=5):
+    """注册系统级兜底任务: 每 N 分钟跑一次 `exe --guard`。
+
+    为什么需要它: 主程序没运行(或刚被硬杀)时, 上面那个 net_guard_loop 根本
+    不存在 —— 而恰恰是这时候最容易留下 DNS 残留。计划任务由系统拉起, 不依赖
+    我们的进程存活, 是真正的最后一道防线。
+    """
+    if not _IS_WIN:
+        return False, "仅支持 Windows"
+    exe = sys.executable if getattr(sys, "frozen", False) else None
+    if not exe:
+        return False, "源码模式不注册(打包后的 exe 才需要)"
+    tr = '"%s" --guard' % exe
+    try:
+        r = _run(["schtasks", "/create", "/tn", GUARD_TASK, "/tr", tr,
+                  "/sc", "minute", "/mo", str(minutes), "/rl", "highest", "/f"],
+                 capture_output=True, timeout=40)
+        _WD_CACHE["ts"] = 0
+        if r.returncode == 0:
+            log("已注册系统级网络兜底任务(每 %d 分钟检查一次, 不依赖本程序运行)" % minutes)
+            return True, "ok"
+        return False, ((r.stderr or r.stdout or b"").decode("utf-8", "ignore").strip()[:200])
+    except Exception as e:
+        return False, str(e)
+
+
+def unregister_watchdog():
+    if not _IS_WIN:
+        return False, "仅支持 Windows"
+    try:
+        r = _run(["schtasks", "/delete", "/tn", GUARD_TASK, "/f"],
+                 capture_output=True, timeout=30)
+        _WD_CACHE["ts"] = 0
+        return (r.returncode == 0), "ok" if r.returncode == 0 else "未找到该任务"
+    except Exception as e:
+        return False, str(e)
+
+
+def run_guard_once():
+    """一次性网络兜底(计划任务每 5 分钟调一次, 无界面、不启服务)。
+
+    只做一件事: 上不了网就按分级退让救回来。正常情况一轮解析就返回, 耗时毫秒级。
+    """
+    try:
+        ok, detail = net_ok()
+        if ok:
+            log("[guard] 网络正常 (%s)" % detail)
+            return 0
+        log("[guard] 检测到网络不可用 (%s), 开始急救" % detail, logging.WARNING)
+        ok2, msg2 = rescue_network("计划任务巡检")
+        log("[guard] 急救结果: " + msg2, logging.INFO if ok2 else logging.ERROR)
+        return 0 if ok2 else 1
+    except Exception as e:
+        log("[guard] 巡检异常: " + str(e), logging.WARNING)
+        return 1
+
+
 # ====================== 核心操作 ======================
 def enable_split():
     """按当前分路模式启用。route_mode=proxy 时走 Proxy 分路(不开 TUN)。"""
@@ -2175,6 +2442,9 @@ def enable_split():
             state["dns_proxy"] = False
         if settings.get("smart_dns", True):
             teardown_smart_dns()
+        # 启用失败本身不是最坏结果, "失败之后还上不了网"才是。收尾确认一次。
+        threading.Thread(target=ensure_net_ok,
+                         args=("启用分流失败",), daemon=True).start()
     finally:
         with state_lock:
             state["running"] = False
@@ -2219,6 +2489,9 @@ def disable_split():
         log("停用失败: " + str(e), logging.ERROR)
         with state_lock:
             state["error"] = str(e)
+        # 停用失败可能停在「隧道还连着、DNS 还被接管」的中间态, 兜一次
+        threading.Thread(target=ensure_net_ok,
+                         args=("停用分流失败",), daemon=True).start()
     finally:
         with state_lock:
             state["running"] = False
@@ -3141,6 +3414,12 @@ def get_status():
             "smart_dns": settings.get("smart_dns", True),
             "dns_proxy": state.get("dns_proxy", False),
             "dns_stats": dict(dns_stats),
+            "net_ok": net_state["ok"],
+            "net_detail": net_state["detail"],
+            "net_down": state.get("net_down", False),
+            "rescue": state.get("rescue"),
+            "net_guard": settings.get("net_guard", True),
+            "guard_task": watchdog_enabled() if _IS_WIN else False,
             "nic_dns": read_nic_dns() if _IS_WIN else [],
             "dns_fallback": _cached_fallback_server(),
             "bridge_stats": dict(bridge_stats),
@@ -3289,7 +3568,7 @@ def make_hicon(rgb):
 
 class TrayApp:
     WM_SHELL = 0x0400 + 1  # WM_USER + 1
-    MSG_OPEN, MSG_ENABLE, MSG_DISABLE, MSG_FIX, MSG_EXIT = 1, 2, 3, 4, 5
+    MSG_OPEN, MSG_ENABLE, MSG_DISABLE, MSG_FIX, MSG_RESCUE, MSG_EXIT = 1, 2, 3, 4, 5, 6
     CLASS_NAME = "WarpSplitTray"
     UID = 1
     NIM_ADD, NIM_MODIFY, NIM_DELETE = 0x0, 0x1, 0x2
@@ -3455,6 +3734,7 @@ class TrayApp:
         user32.AppendMenuW(menu, MF_STRING, self.MSG_ENABLE, "启用分流")
         user32.AppendMenuW(menu, MF_STRING, self.MSG_DISABLE, "停用分流")
         user32.AppendMenuW(menu, MF_STRING, self.MSG_FIX, "修复 IPv6")
+        user32.AppendMenuW(menu, MF_STRING, self.MSG_RESCUE, "网络急救")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, "")
         user32.AppendMenuW(menu, MF_STRING, self.MSG_EXIT, "退出")
         pos = ctypes.wintypes.POINT()
@@ -3477,6 +3757,11 @@ class TrayApp:
                 threading.Thread(target=disable_split, daemon=True).start()
         elif cmd == self.MSG_FIX:
             fix_ipv6()
+        elif cmd == self.MSG_RESCUE:
+            def _r():
+                ok, msg = rescue_network("托盘菜单手动触发")
+                log("网络急救: " + msg, logging.INFO if ok else logging.ERROR)
+            threading.Thread(target=_r, daemon=True).start()
         elif cmd == self.MSG_EXIT:
             self.quit()
 
@@ -3612,6 +3897,19 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/restore":
             threading.Thread(target=restore, daemon=True).start()
             self._json({"ok": True})
+        elif p == "/api/rescue":
+            # 手动「网络急救」。放后台线程: 分级退让最多要几十秒。
+            def _rescue():
+                ok, msg = rescue_network("用户手动触发")
+                log("手动网络急救: " + msg, logging.INFO if ok else logging.ERROR)
+            threading.Thread(target=_rescue, daemon=True).start()
+            self._json({"ok": True, "msg": "已开始网络急救"})
+        elif p == "/api/guard-task":
+            on = bool(payload.get("on", True))
+            settings["net_watchdog"] = on
+            save_settings()
+            ok, out = register_watchdog(5) if on else unregister_watchdog()
+            self._json({"ok": ok, "msg": out})
         elif p == "/api/refresh":
             threading.Thread(target=refresh_list, daemon=True).start()
             self._json({"ok": True})
@@ -3622,7 +3920,7 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("theme", "auto_reconnect", "auto_heal", "auto_update",
                       "auto_resume", "metrics_speed", "tray",
                       "proxy_port", "bridge_port", "system_proxy",
-                      "smart_dns"):
+                      "smart_dns", "net_guard"):
                 if k in payload:
                     settings[k] = payload[k]
             save_settings()
@@ -3735,6 +4033,13 @@ def main():
     load_settings()
     load_state()
 
+    # 一次性巡检模式: 计划任务每 5 分钟拉起一次, 不启服务、不出界面。
+    # 必须在单实例检测之前处理 —— 否则主程序在跑时巡检会被端口占用分支
+    # 直接 exit(0) 掉, 而恰恰这时候它的价值最低(有看门狗), 反过来主程序
+    # 不在时它才最该跑。
+    if "--guard" in sys.argv:
+        sys.exit(run_guard_once())
+
     url = "http://127.0.0.1:%d/" % PORT
 
     # 单实例: 端口已被占用说明已有实例在运行。此时不再启动第二个进程,
@@ -3793,8 +4098,20 @@ def main():
     threading.Thread(target=autoupdate_loop, daemon=True).start()
     threading.Thread(target=egress_loop, daemon=True).start()
     threading.Thread(target=dns_guard_loop, daemon=True).start()
+    # 网络保障看门狗: 与分流是否启用无关, 全程在跑
+    threading.Thread(target=net_guard_loop, daemon=True).start()
     # 校对上次留下的 enabled 标志, 避免"一启动就自己动网络"
     threading.Thread(target=reconcile_state_on_startup, daemon=True).start()
+
+    # 系统级兜底: 本程序没运行时(被硬杀 / 没启动)由计划任务兜住 DNS 残留。
+    # 注册失败不致命(看门狗还在), 只记日志, 不打断启动。
+    if settings.get("net_watchdog", True) and _IS_WIN:
+        if not watchdog_enabled():
+            def _reg():
+                ok, msg = register_watchdog(5)
+                if not ok:
+                    log("系统级网络兜底任务注册失败: " + msg, logging.WARNING)
+            threading.Thread(target=_reg, daemon=True).start()
 
     try:
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

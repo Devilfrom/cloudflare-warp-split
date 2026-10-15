@@ -209,6 +209,24 @@
       </div>
     </div>
 
+    <div class="card">
+      <h2>网络保障 <span style="font-size:11px;color:var(--sub)">（底线：任何时候都要能上网）</span></h2>
+      <div class="kv"><span class="k">当前联网状态</span><span class="val" id="kvNetOk">—</span></div>
+      <div class="kv"><span class="k">最近一次自动处理</span><span class="val" id="kvRescue">无</span></div>
+      <div class="dnsnote" id="netNote"></div>
+      <div class="row" style="margin-top:10px">
+        <div><div>看门狗（程序运行时）</div><div class="desc">每 20 秒探测一次联网；连续两次失败就自动逐级退让：先还原网卡 DNS → 再断开 WARP 回到直连 → 最后强制清空 DNS。与分流是否启用无关，全程在跑</div></div>
+        <div class="tswitch" id="swNetGuard"></div>
+      </div>
+      <div class="row">
+        <div><div>系统兜底任务</div><div class="desc">注册系统计划任务，每 5 分钟巡检一次 —— 程序被强杀或没启动时，靠它兜住「DNS 残留导致全机断网」</div></div>
+        <div class="tswitch" id="swGuardTask"></div>
+      </div>
+      <div class="btns" style="margin-top:12px">
+        <button id="btnRescue">立即网络急救</button>
+      </div>
+    </div>
+
     <div class="card settings">
       <h2>设置</h2>
       <div class="row">
@@ -424,6 +442,26 @@ function setStatus(st){
     dn.innerHTML="<b>✓ 已接管</b>：国内域名用国内 DNS 解析（拿到国内 CDN 节点，走直连），境外域名走公网 DNS 经隧道查询（不会被污染）。";
   } else { dn.className="dnsnote"; }
 
+  // ---- 网络保障 ----
+  const netOk = !!st.net_ok;
+  $("kvNetOk").textContent = netOk ? ("正常 · 已解析 " + (st.net_detail||"")) :
+    (st.net_down ? ("⚠ 不可用（" + (st.net_detail||"") + "）· 正在自动处理") : "检测中…");
+  const rc = st.rescue;
+  $("kvRescue").textContent = rc
+    ? ((rc.ok ? "已恢复" : "未恢复") + " · " + (rc.level||"") + " · " +
+       (rc.detail||"") + (rc.steps && rc.steps.length ? "（" + rc.steps.join("；") + "）" : ""))
+    : "无";
+  const nn = $("netNote");
+  if(netOk){
+    nn.className = "dnsnote show";
+    nn.innerHTML = "<b>✓ 联网正常</b>：看门狗每 20 秒探测一次；一旦连续失败会自动退让，先保网络再谈加速。";
+  } else {
+    nn.className = "dnsnote show warn";
+    nn.innerHTML = "<b>⚠ 检测到上不了网</b>：看门狗会自动逐级退让（还原网卡 DNS → 断开 WARP 回到直连 → 强制清空 DNS）。若长时间未恢复，请点「立即网络急救」。";
+  }
+  setToggle("swNetGuard", st.net_guard !== false);
+  setToggle("swGuardTask", !!st.guard_task);
+
   // 设置开关同步
   setToggle("swReconnect", st.auto_reconnect);
   setToggle("swAutoHeal", st.auto_heal);
@@ -525,6 +563,27 @@ $("btnFixIpv6").addEventListener("click",function(){
   this.disabled=true;
   fetch("/api/fix_ipv6",{method:"POST"}).then(r=>r.json()).then(d=>{ toast(d.msg||"已执行 IPv6 修复"); })
   .catch(()=>toast("请求失败")).finally(()=>setTimeout(()=>{this.disabled=false;},1500));
+});
+$("btnRescue").addEventListener("click",function(){
+  this.disabled=true; const t=this.textContent; this.textContent="急救中...";
+  fetch("/api/rescue",{method:"POST"}).then(r=>r.json()).then(()=>{
+    toast("已开始网络急救：正在逐级退让，稍后看上方状态"); })
+  .catch(()=>toast("请求失败"))
+  .finally(()=>{ setTimeout(()=>{this.disabled=false; this.textContent=t; loadStatus(); },4000); });
+});
+$("swNetGuard").addEventListener("click",function(){
+  const on=!this.classList.contains("on"); setToggle("swNetGuard",on);
+  postJSON("/api/settings",{net_guard:on});
+  toast(on?"看门狗已开启：上不了网时会自动退让":"看门狗已关闭（不建议）");
+});
+$("swGuardTask").addEventListener("click",function(){
+  const on=!this.classList.contains("on"); setToggle("swGuardTask",on);
+  fetch("/api/guard-task",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({on:on})}).then(r=>r.json()).then(d=>{
+    toast(on?(d.ok?"系统兜底任务已注册（每 5 分钟巡检）":"注册失败："+(d.msg||""))
+            :(d.ok?"系统兜底任务已移除":"移除失败："+(d.msg||"")));
+    loadStatus();
+  }).catch(()=>toast("请求失败"));
 });
 $("btnSelfTest").addEventListener("click",function(){
   this.disabled=true; const t=this.textContent; this.textContent="自检中...";
