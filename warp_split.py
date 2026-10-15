@@ -27,13 +27,16 @@ import os
 import sys
 import re
 import json
+import atexit
 import time
 import struct
 import shutil
 import socket
 import select
+import hashlib
 import threading
 import subprocess
+from socketserver import ThreadingUDPServer, BaseRequestHandler
 
 # ====================== 子进程无窗口启动 ======================
 # 必须统一走 _run(): 打包后的程序是 --windowed(无控制台), 此时任何
@@ -212,6 +215,7 @@ state = {
     "route_active": None,     # 当前实际生效的分路: "tun" / "proxy" / None
     "bridge_up": False,       # 本地分流桥是否在监听
     "sysproxy_on": False,     # 是否已写入 Windows 系统代理
+    "dns_proxy": False,       # 本地智能 DNS 分流是否在接管网卡 DNS
 }
 state_lock = threading.Lock()
 op_stop = threading.Event()
@@ -235,6 +239,8 @@ settings = {
     "bridge_port": 7890,          # 本地智能分流 HTTP 桥端口
     "system_proxy": False,        # 是否把分流桥写进 Windows 系统代理(默认关)
     "_sysproxy_backup": None,     # 系统代理原值备份, 用于精确还原
+    # ---- 智能 DNS 分流(决定国内站能否跑满带宽, 默认开) ----
+    "smart_dns": True,            # 用本地 DNS 代理按域名分流解析
 }
 
 # 指标 (内存态, 不持久化)
@@ -1438,6 +1444,619 @@ def disable_proxy_route():
             state["action"] = None
 
 
+# ====================== 智能 DNS 分流代理 ======================
+# 为什么必须有这一段(这是「开启分流后千兆跑不满」的真正元凶):
+#
+#   WARP 在 TUN(mode warp)下会把物理网卡的 DNS 强制改成 127.0.2.2 / 127.0.2.3
+#   —— 那是它自己的 DNS 代理, 查询经隧道送到 Cloudflare 再出去。它只排除了
+#   IP, 从不排除 DNS。于是:
+#       国内 CDN 的智能 DNS 看到的是「来自境外的查询」, 返回境外/次优节点 IP;
+#       这些 IP 不在中国规则库里, 于是流量也一并走隧道 —— 国内站绕地球一圈。
+#
+#   实测(本机): baidu.com 被解析到 103.235.46.x, taobao.com 到 155.102.176.x,
+#   腾讯云镜像到新加坡 101.33.x / 43.159.x; 建连 RTT 从 14.7ms 劣化到 521ms。
+#   TCP 吞吐上限 ≈ 窗口/RTT, Windows 默认窗口下 500ms RTT 单流根本跑不满千兆。
+#
+#   而 warp-cli 的 dns 子命令只有 fallback/families/gateway-id, 没有「自定义
+#   DNS 服务器」的口子, 官方在 TUN 模式下不给改。所以只能自己接管:
+#
+#   监听 127.0.0.1:53(WARP 只占 127.0.2.2/.3, 这个地址是空的), 把网卡 DNS
+#   指向它; 对国内域名用国内 DNS 解析(拿到国内 CDN 节点, 走直连), 其余交给
+#   WARP DNS(保证被污染/境外域名仍能正确解析)。
+
+DNS_CN = os.environ.get("WARP_SPLIT_DNS_CN", "223.5.5.5")     # 阿里 DNS
+DNS_CN_FALLBACK = "119.29.29.29"                              # 腾讯 DNS
+# 「境外」分支的上游。**绝不能填 127.0.2.2(WARP 自带 DNS 代理)** —— 会死循环:
+#   我们的代理问 127.0.2.2 查 google.com
+#     -> WARP 发现 "com" 命中 fallback 后缀, 把查询转回 127.0.0.1(我们)
+#     -> 我们再问 127.0.2.2 -> ...
+#   实测表现为 3.5s 超时、只能退回国内结果(被污染)。
+# 用公网 DNS 则没有这个问题: 1.1.1.1 会经 WARP 隧道出境, 拿到的正是
+# "从境外访问"的视角, 与 WARP 原生 DNS 一致, 且实测 169ms、未被劫持。
+DNS_WARP = os.environ.get("WARP_SPLIT_DNS_INTL", "1.1.1.1")
+DNS_WARP_FALLBACK = os.environ.get("WARP_SPLIT_DNS_INTL2", "8.8.8.8")
+DNS_LISTEN_ADDR = "127.0.0.1"
+DNS_LISTEN_PORT = 53
+_DNS_CACHE = {}                 # question 摘要 -> (时间戳, 响应报文)
+_DNS_CACHE_TTL = 120
+_DNS_SERVER = None
+_DNS_LOCK = threading.Lock()
+dns_stats = {"cn": 0, "warp": 0, "fallback": 0, "errors": 0}
+
+# ---- 把这些后缀交给本地智能 DNS 解析 ----
+# WARP 的「fallback domains」机制: 命中后缀的域名, 其 DNS 查询不进隧道,
+# 而是转给 fallback 服务器(见 `warp-cli dns default-fallbacks`)。
+#
+# 【实测结论, 与直觉相反, 别踩坑】
+# 1) fallback 服务器默认**不是** 127.0.0.1, 而是网卡 DHCP 学来的地址
+#    (本机是路由器 192.168.33.1:53)。所以光加后缀是不够的 —— 查询会转给
+#    路由器 DNS, 国内域名确实能拿国内节点, 但境外域名会被 ISP 污染
+#    (实测 google.com 被解析成 31.13.92.37, 那是 Facebook 的段)。
+# 2) 改网卡 DNS **争不过** WARP: CloudflareWARP 适配器 metric 更低, 系统
+#     DNS 客户端永远优先它的 127.0.2.2(实测把 metric 调到 50 也无效)。
+# 3) 但 **fallback 服务器会跟随网卡 DNS** —— 而且只在网卡 DNS 是**单条目**
+#    时才跟随(实测写两条 127.0.0.1+223.5.5.5 会退回路由器)。所以正确姿势是:
+#        a. 先在 127.0.0.1:53 起本地智能 DNS
+#        b. 把网卡 DNS 设为**单条** 127.0.0.1
+#        c. 再加后缀
+#    这样 WARP 的 default-fallbacks 就变成 127.0.0.1:53, 命中后缀的域名
+#    正式转交我们的代理, 国内拿国内节点、境外拿干净的 WARP 结果, 零污染。
+# 4) 风险与兜底: 代理一死, 命中后缀的域名就解析不了(后缀覆盖 com/net/org
+#    等, 影响面很大)。所以 dns_guard_loop 每轮都会核对「代理活着 且
+#    default-fallbacks 是 127.0.0.1」, 一旦救不回来就**立刻把网卡 DNS
+#    还原成 DHCP**, 退化成 WARP 原生行为, 绝不让用户断网。
+DNS_FALLBACK_SUFFIXES = (
+    # 国内常用
+    "cn", "com.cn", "net.cn", "org.cn", "edu.cn", "gov.cn", "ac.cn",
+    "com", "net", "org", "edu", "gov",
+    # 国际常见后缀: 多数是境外站, 但一样交给本地代理按 IP 归属判定更准 ——
+    # 判成国内就拿国内节点, 判成境外照旧走 WARP DNS, 不会解析错。
+    "io", "co", "app", "dev", "xyz", "top", "club", "vip", "shop",
+    "info", "biz", "me", "tv", "cc", "online", "site", "tech", "ai",
+    "cloud", "wiki", "name", "pro", "work", "life", "world", "space",
+)
+
+# 改 DNS 时要跳过的网卡: WARP 自己的隧道、企业 VPN 虚拟网卡(本机有深信服
+# aTrust VNIC)、各类虚拟化网卡。改它们的 DNS 没有意义, 还可能破坏业务网络。
+_NIC_SKIP_RE = r"WARP|Cloudflare|TAP|Virtual|Sangfor|aTrust|VPN|Hyper-V|VMware|VirtualBox|Loopback|Teredo|isatap"
+
+
+def _dns_parse_question(data):
+    """取出 DNS 查询报文里的 (qname, qtype)。失败返回 (None, 0)。"""
+    try:
+        i = 12
+        labels = []
+        while i < len(data):
+            ln = data[i]
+            if ln == 0:
+                i += 1
+                break
+            labels.append(data[i + 1:i + 1 + ln].decode("latin-1"))
+            i += 1 + ln
+        qtype = struct.unpack("!H", data[i:i + 2])[0]
+        return ".".join(labels).lower().rstrip("."), qtype
+    except Exception:
+        return None, 0
+
+
+def _dns_extract_ips(resp, want_type):
+    """从 DNS 应答里提取 A(1) / AAAA(28) 记录的 IP 列表。"""
+    ips = []
+    try:
+        if not resp or len(resp) < 12:
+            return ips
+        qd, an = struct.unpack("!HH", resp[4:8])
+        i = 12
+        for _ in range(qd):                      # 跳过问题区
+            while i < len(resp) and resp[i] != 0:
+                i += 1 + resp[i]
+            i += 5
+        for _ in range(an):                      # 遍历应答区
+            if i >= len(resp):
+                break
+            if resp[i] & 0xC0 == 0xC0:           # 压缩指针
+                i += 2
+            else:
+                while i < len(resp) and resp[i] != 0:
+                    i += 1 + resp[i]
+                i += 1
+            if i + 10 > len(resp):
+                break
+            rtype, _cls, _ttl, rdl = struct.unpack("!HHIH", resp[i:i + 10])
+            i += 10
+            rd = resp[i:i + rdl]
+            i += rdl
+            if rtype == want_type:
+                try:
+                    if want_type == 1 and rdl == 4:
+                        ips.append(socket.inet_ntoa(rd))
+                    elif want_type == 28 and rdl == 16:
+                        ips.append(socket.inet_ntop(socket.AF_INET6, rd))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return ips
+
+
+def _dns_forward(data, upstream, timeout=3.0):
+    """把原始查询报文转发给上游 DNS, 返回响应报文或 None。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(data, (upstream, 53))
+        resp, _ = s.recvfrom(4096)
+        s.close()
+        return resp
+    except Exception:
+        return None
+
+
+_DNS_ROUTE_CACHE = {}       # (qname, qtype) -> (时间戳, "cn" | "warp")
+_DNS_ROUTE_TTL = 600        # 记住某个域名该问谁, 避免每次都问两边
+
+
+def _dns_resolve_once(data):
+    """分流判定: 国内域名用国内 DNS(拿国内 CDN 节点), 境外域名交给 WARP DNS。
+
+    「解析出的 IP 全部在国内才认定国内」的道理与分流桥一致: 判错成国内=
+    站点打不开(失败), 判错成 WARP=只是慢一点, 宁可慢不可不可用。
+
+    性能: 首次见到的域名并行问两边(总耗时取较慢的那个, 而非两者之和);
+    判定结果记住 10 分钟, 之后只问该问的那一个 —— 国内域名约 17ms。
+    """
+    qname, qtype = _dns_parse_question(data)
+    now = time.time()
+    ck = (qname, qtype)
+    way = None
+    ent = _DNS_ROUTE_CACHE.get(ck)
+    if ent and now - ent[0] < _DNS_ROUTE_TTL:
+        way = ent[1]
+
+    if way == "cn":
+        r = _dns_forward(data, DNS_CN, timeout=2.5)
+        if r:
+            dns_stats["cn"] += 1
+            return r
+        way = None
+    elif way == "warp":
+        r = _dns_forward(data, DNS_WARP, timeout=3.5)
+        if not r:
+            r = _dns_forward(data, DNS_WARP_FALLBACK, timeout=3.0)
+        if r:
+            dns_stats["warp"] += 1
+            return r
+        way = None
+
+    # 首次见到这个域名 -> 并行问两边
+    res = {}
+
+    def _ask(key, up, to):
+        res[key] = _dns_forward(data, up, timeout=to)
+
+    t1 = threading.Thread(target=_ask, args=("cn", DNS_CN, 2.5))
+    t2 = threading.Thread(target=_ask, args=("warp", DNS_WARP, 3.5))
+    t1.start()
+    t2.start()
+    t1.join()                       # 先拿国内的结果做判定
+    resp_cn = res.get("cn")
+    if qtype == 1 and resp_cn:
+        ips = _dns_extract_ips(resp_cn, 1)
+        if ips and all(is_cn_ip(i) or is_private_ip(i) for i in ips):
+            _DNS_ROUTE_CACHE[ck] = (time.time(), "cn")
+            dns_stats["cn"] += 1
+            return resp_cn
+    t2.join()
+    resp_w = res.get("warp")
+    if not resp_w:
+        resp_w = _dns_forward(data, DNS_WARP_FALLBACK, timeout=3.0)
+    if resp_w:
+        _DNS_ROUTE_CACHE[ck] = (time.time(), "warp")
+        dns_stats["warp"] += 1
+        return resp_w
+    if resp_cn:
+        dns_stats["fallback"] += 1
+        return resp_cn
+    return None
+
+
+class _DNSRequestHandler(BaseRequestHandler):
+    """UDP DNS 处理器。任何异常都必须吞掉并返回兜底应答 —— 这个服务挂了
+    等于本机断网, 绝不能因为一个畸形报文把线程打死。"""
+
+    def handle(self):
+        try:
+            data, sock = self.request
+            if not data or len(data) < 12:
+                return
+            key = hashlib.md5(data[12:]).digest()
+            now = time.time()
+            ent = _DNS_CACHE.get(key)
+            if ent and now - ent[0] < _DNS_CACHE_TTL:
+                resp = bytearray(ent[1])
+                resp[0:2] = data[0:2]        # 换回本次的事务 ID
+                sock.sendto(bytes(resp), self.client_address)
+                return
+            resp = _dns_resolve_once(data)
+            if resp:
+                _DNS_CACHE[key] = (now, resp)
+                resp = bytearray(resp)
+                resp[0:2] = data[0:2]
+                sock.sendto(bytes(resp), self.client_address)
+        except Exception:
+            dns_stats["errors"] += 1
+
+
+def start_smart_dns():
+    """启动本地 DNS 分流代理(127.0.0.1:53)。返回 (ok, msg)。"""
+    global _DNS_SERVER
+    with _DNS_LOCK:
+        if _DNS_SERVER is not None:
+            return True, "已在运行"
+        try:
+            srv = ThreadingUDPServer((DNS_LISTEN_ADDR, DNS_LISTEN_PORT),
+                                     _DNSRequestHandler)
+            srv.daemon_threads = True
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            _DNS_SERVER = srv
+            log("智能 DNS 分流已启动: %s:%d (国内 %s / 境外 %s)" %
+                (DNS_LISTEN_ADDR, DNS_LISTEN_PORT, DNS_CN, DNS_WARP))
+            return True, "started"
+        except Exception as e:
+            log("智能 DNS 启动失败: " + str(e), logging.WARNING)
+            return False, str(e)
+
+
+def stop_smart_dns():
+    """停掉本地 DNS 分流代理。"""
+    global _DNS_SERVER
+    with _DNS_LOCK:
+        if _DNS_SERVER is None:
+            return
+        try:
+            _DNS_SERVER.shutdown()
+            _DNS_SERVER.server_close()
+        except Exception:
+            pass
+        _DNS_SERVER = None
+        log("智能 DNS 分流已停止")
+
+
+def _ps(body, timeout=40):
+    """跑一段 PowerShell 并取回 stdout。
+
+    【中文 Windows 的坑, 踩过一次】PowerShell 的输出编码跟随控制台代码页,
+    中文系统上是 GBK(936)。网卡名恰恰是中文("以太网"), 用 text=True 让
+    Python 按 UTF-8 解会直接抛 UnicodeDecodeError, stdout 变 None ——
+    表现为"枚举不到网卡", 极难排查。这里在命令前强制把输出编码设成 UTF-8,
+    并用 errors='replace' 兜底, 保证任何代码页下都能拿到东西。
+    """
+    prefix = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+              "$OutputEncoding=[System.Text.Encoding]::UTF8; ")
+    try:
+        r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                  prefix + body], capture_output=True, timeout=timeout)
+        out = r.stdout.decode("utf-8", errors="replace") if r.stdout else ""
+        return r.returncode, out
+    except Exception as e:
+        return -1, str(e)
+
+
+def _nic_indexes():
+    """需要改 DNS 的物理网卡 ifIndex 列表(排除 WARP/VPN/虚拟网卡)。
+
+    返回**数字**而不是网卡名: 一是彻底绕开中文编码问题, 二是
+    Set-DnsClientServerAddress / netsh 都认 ifIndex, 更稳。
+    """
+    body = ("Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and "
+            "$_.InterfaceDescription -notmatch '%s' } | "
+            "ForEach-Object { $_.ifIndex }" % _NIC_SKIP_RE)
+    rc, out = _ps(body, timeout=30)
+    idx = []
+    for x in out.splitlines():
+        x = x.strip()
+        if x.isdigit():
+            idx.append(int(x))
+    return idx
+
+
+def apply_nic_dns(servers):
+    """把物理网卡的 DNS 设为给定列表(排除 WARP/企业VPN/虚拟网卡)。
+    传入空列表表示还原为 DHCP 自动获取。返回 (ok, msg)。
+
+    三个坑(都实测过):
+      - 中文 Windows 上 PowerShell 输出是 GBK, 按 UTF-8 解会抛异常、stdout
+        变 None, 表现为"枚举不到网卡"。所以只取数字 ifIndex(见 _ps/_nic_indexes)。
+      - 还原时 `Set-DnsClientServerAddress -ServerAddresses @()` 是**无效的**,
+        注册表里的静态 NameServer 会原样留着 —— 表现为「程序退出了但网卡
+        还指向 127.0.0.1, 而代理已死」, 用户直接断网。这个 bug 我踩过一次。
+        这里用 -ResetServerAddresses, 并在之后**复查注册表**, 没清干净就
+        再用 netsh 兜底一次。
+      - WARP 只在网卡 DNS 是**单条目**时才把它学成 fallback 服务器,
+        所以调用方要传一个元素的列表(不要塞备用 DNS, 那样会失效)。
+    """
+    if not _IS_WIN:
+        return False, "仅支持 Windows"
+    idxs = _nic_indexes()
+    if not idxs:
+        return False, "未找到物理网卡"
+    errs = []
+    for idx in idxs:
+        try:
+            if servers:
+                arg = ",".join("'%s'" % s for s in servers)
+                body = ("Set-DnsClientServerAddress -InterfaceIndex %d "
+                        "-ServerAddresses @(%s)" % (idx, arg))
+            else:
+                body = ("Set-DnsClientServerAddress -InterfaceIndex %d "
+                        "-ResetServerAddresses" % idx)
+            rc, out = _ps(body, timeout=40)
+            if rc != 0:
+                errs.append("idx%s: %s" % (idx, out.strip()[:80]))
+        except Exception as e:
+            errs.append("idx%s: %s" % (idx, str(e)[:80]))
+    if not servers and not errs:
+        # 复查: 静态 DNS 是否真被清掉
+        if _static_dns_left():
+            _reset_dns_via_netsh()
+            if _static_dns_left():
+                errs.append("还原后仍残留静态 DNS")
+    if errs:
+        return False, "; ".join(errs)
+    return True, "ok"
+
+
+def _static_dns_left():
+    """注册表里是否还留着我们可能写过的静态 DNS(127.0.0.1)。"""
+    rc, out = _ps("Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\"
+                  "Services\\Tcpip\\Parameters\\Interfaces\\*' -Name NameServer "
+                  "-ErrorAction SilentlyContinue | Where-Object { $_.NameServer } | "
+                  "ForEach-Object { $_.NameServer }", timeout=30)
+    return "127.0.0.1" in (out or "")
+
+
+def _reset_dns_via_netsh():
+    """netsh 兜底还原网卡 DNS(实测有效, PowerShell 那条路有时会留残留)。"""
+    rc, out = _ps("Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | "
+                  "ForEach-Object { $_.Name }", timeout=30)
+    for nm in (out or "").splitlines():
+        nm = nm.strip()
+        if not nm:
+            continue
+        try:
+            _run(["netsh", "interface", "ipv4", "delete", "dnsservers", nm, "all"],
+                 capture_output=True, timeout=40)
+        except Exception:
+            pass
+
+
+def setup_smart_dns(wait_ready=True, rounds=8):
+    """装配智能 DNS 分流。返回 (ok, msg)。
+
+    顺序很关键 —— 先把代理跑起来, 再把网卡 DNS 指过去, 最后加后缀。
+    反过来的话会有一小段「网卡指向 127.0.0.1 但没有监听」的窗口, 表现为
+    所有解析卡一下; 实测在这个窗口里 WARP 连握手都会卡在 happy eyeballs。
+
+    装完还要等它真正生效: 改网卡 DNS 属于「网络配置变化」, WARP 有时会以
+    "Settings Changed" 为由把隧道短暂断掉, 而 `dns default-fallbacks` 只在
+    连着时才有值。所以这里轮询等待, 发现断了就重连(排除规则还在配置里,
+    重连是秒级的), 直到 fallback 服务器变成 127.0.0.1。
+    """
+    if not _IS_WIN:
+        return False, "仅支持 Windows"
+    ok, msg = start_smart_dns()
+    if not ok:
+        # 代理起不来就别动网卡 —— 否则等于自断 DNS
+        return False, "本地 DNS 代理未启动: " + msg
+    ok2, msg2 = apply_nic_dns([DNS_LISTEN_ADDR])
+    if not ok2:
+        stop_smart_dns()
+        return False, "网卡 DNS 改写失败: " + msg2
+    n = apply_dns_fallbacks()
+    if n == 0:
+        teardown_smart_dns()
+        return False, "WARP 未能接受 fallback 后缀"
+
+    if wait_ready:
+        for _ in range(rounds):
+            time.sleep(3)
+            okc, out = warp(["status"], timeout=12)
+            if "Connected" not in (out or ""):
+                # 被我们的改动弄断了 —— 重连一次再验
+                connect_warp(max_attempts=2, update_phase=False)
+                continue
+            if DNS_LISTEN_ADDR in dns_fallback_server():
+                return True, "已接管 (代理 + 网卡 DNS + %d 条后缀)" % n
+        # 没等到: 后缀已经写进去了, 先按"部分生效"返回, 剩下的交给
+        # dns_guard_loop 每 30 秒继续修。不在这里判失败, 否则会把刚建好的
+        # 隧道又拆掉, 反而更糟。
+        return True, "已接管但 WARP 尚未确认 fallback 服务器(守卫线程会继续修)"
+
+    return True, "已接管 (代理 + 网卡 DNS + %d 条后缀)" % n
+    return True, "已接管 (代理 + 网卡 DNS + %d 条后缀)" % n
+
+
+def teardown_smart_dns():
+    """拆卸智能 DNS 分流, 顺序与装配相反: 先撤后缀, 再停代理, 最后还原网卡。
+
+    「先撤后缀」很重要: 后缀还在但代理已停的话, 命中后缀的域名会解析失败。
+    """
+    reset_dns_fallbacks()
+    stop_smart_dns()
+    apply_nic_dns([])
+
+
+def toggle_smart_dns(on):
+    """在程序运行中切换智能 DNS 开关(供 /api/settings 用)。
+
+    为什么不能在请求线程里直接干完就完事: 无论是装配还是拆卸, 都会动
+    `dns fallback` 列表, 而 WARP 把这个当「设置变更」—— 隧道会被断掉
+    (实测确认)。分流还开着的话必须再连回来, 否则用户点一下开关就断网了。
+    排除规则还在配置里, 重连是秒级的。
+    """
+    try:
+        if on:
+            ok, msg = setup_smart_dns(wait_ready=False)
+            with state_lock:
+                state["dns_proxy"] = ok
+            log("智能 DNS 已开启: " + msg if ok else
+                "智能 DNS 开启失败: " + msg, logging.INFO if ok else logging.WARNING)
+        else:
+            teardown_smart_dns()
+            with state_lock:
+                state["dns_proxy"] = False
+            log("智能 DNS 已关闭, 已还原网卡 DNS")
+        # 分流开着就把隧道接回来
+        if state.get("enabled") and settings.get("route_mode", "tun") == "tun":
+            ok, out = warp(["status"], timeout=12)
+            if "Connected" not in (out or ""):
+                connect_warp(max_attempts=3, update_phase=False)
+                log("切换智能 DNS 后已重新连接 WARP")
+    except Exception as e:
+        log("切换智能 DNS 失败: " + str(e), logging.WARNING)
+
+
+def dns_fallback_server():
+    """读取 WARP 当前的 fallback 服务器, 用于守卫校验。返回字符串或 ''。"""
+    try:
+        ok, out = warp(["dns", "default-fallbacks"], timeout=15)
+        return (out or "").strip() if ok else ""
+    except Exception:
+        return ""
+
+
+_FB_SERVER_CACHE = {"ts": 0, "val": ""}
+
+
+def _cached_fallback_server():
+    """同 read_nic_dns 的理由: /api/status 每 1.5 秒一次, 不能每次真去问。"""
+    now = time.time()
+    if now - _FB_SERVER_CACHE["ts"] < 15:
+        return _FB_SERVER_CACHE["val"]
+    _FB_SERVER_CACHE["ts"] = now
+    _FB_SERVER_CACHE["val"] = dns_fallback_server().replace("\n", " ")
+    return _FB_SERVER_CACHE["val"]
+
+
+def _atexit_restore_dns():
+    """进程退出兜底: 撤掉智能 DNS 接管。
+
+    网卡 DNS 指向 127.0.0.1 而本进程已死 = 53 端口无人监听 = 命中后缀的
+    域名全部解析失败。这是本功能最严重的失败模式, 所以专门用 atexit 兜一层。
+    """
+    try:
+        if _DNS_SERVER is not None:
+            teardown_smart_dns()
+            log("atexit: 已还原网卡 DNS 与 WARP fallback")
+    except Exception:
+        pass
+
+
+_NIC_DNS_CACHE = {"ts": 0, "val": []}
+_NIC_DNS_TTL = 20
+
+
+def read_nic_dns(force=False):
+    """读取当前物理网卡的 DNS, 用于展示与守卫校验。
+
+    带 20 秒缓存 —— 控制台每 1.5 秒就会拉一次 /api/status, 而每次真读都要
+    起一个 PowerShell 进程(实测 1-2 秒), 不缓存等于持续 fork 进程。
+    """
+    if not _IS_WIN:
+        return []
+    now = time.time()
+    if not force and now - _NIC_DNS_CACHE["ts"] < _NIC_DNS_TTL:
+        return _NIC_DNS_CACHE["val"]
+    try:
+        body = ("Get-DnsClientServerAddress -AddressFamily IPv4 | "
+                "Where-Object { $_.ServerAddresses.Count -gt 0 } | "
+                "ForEach-Object { $_.ServerAddresses -join ',' }")
+        _rc, out = _ps(body, timeout=20)
+        val = [x.strip() for x in out.splitlines() if x.strip()]
+    except Exception:
+        val = []
+    _NIC_DNS_CACHE["ts"] = now
+    _NIC_DNS_CACHE["val"] = val
+    return val
+
+
+def apply_dns_fallbacks():
+    """把常见域名后缀写进 WARP 的 DNS fallback, 让这些域名的解析转交本地
+    智能 DNS。返回成功写入的条数。"""
+    n = 0
+    for suf in DNS_FALLBACK_SUFFIXES:
+        try:
+            ok, _out = warp(["dns", "fallback", "add", suf], timeout=15)
+            if ok:
+                n += 1
+        except Exception:
+            pass
+    if n:
+        log("已把 %d 个域名后缀交给本地智能 DNS 解析" % n)
+    return n
+
+
+def reset_dns_fallbacks():
+    """还原 WARP 的 DNS fallback 到默认(只留 lan/home/internal 等)。"""
+    try:
+        ok, out = warp(["dns", "fallback", "reset"], timeout=20)
+        if ok:
+            log("已还原 WARP 的 DNS fallback 列表")
+        return ok
+    except Exception:
+        return False
+
+
+def dns_guard_loop():
+    """DNS 守卫 + 故障安全网。只在「已启用 + 智能 DNS + TUN 分路」时动作。
+
+    每轮核对三件事, 任一不满足就修; 修不好就**整体撤退**(还原网卡 DNS),
+    退化成 WARP 原生行为 —— 宁可不分流, 也不能让用户断网:
+      1. 本地代理是否还活着
+      2. WARP 的 fallback 服务器是否仍是 127.0.0.1(重连后可能被改回路由器)
+      3. fallback 后缀是否还在
+    WARP 没连着的时候不做任何事(连着才谈得上分流)。
+    """
+    while not EXIT_EVENT.is_set():
+        EXIT_EVENT.wait(30)
+        try:
+            if not settings.get("smart_dns", True):
+                continue
+            if not state["enabled"] or state["running"]:
+                continue
+            if settings.get("route_mode", "tun") != "tun":
+                continue      # Proxy 分路不改系统 DNS, 无需守卫
+            ok, out = warp(["status"], timeout=12)
+            if "Connected" not in (out or ""):
+                continue
+
+            need = []
+            if _DNS_SERVER is None:
+                need.append("代理已停止")
+            if DNS_LISTEN_ADDR not in dns_fallback_server():
+                need.append("fallback 服务器已漂移")
+            ok2, fl = warp(["dns", "fallback", "list"], timeout=15)
+            if not ok2 or "com" not in (fl or ""):
+                need.append("后缀已丢失")
+            if not need:
+                continue
+
+            log("智能 DNS 状态异常(%s), 尝试恢复..." % "、".join(need),
+                logging.WARNING)
+            ok3, msg3 = setup_smart_dns()
+            if ok3:
+                log("智能 DNS 已恢复: " + msg3)
+            else:
+                # 救不回来 —— 立刻整体撤退, 保证网络可用
+                teardown_smart_dns()
+                with state_lock:
+                    state["dns_proxy"] = False
+                log("智能 DNS 无法恢复(%s), 已整体还原为 WARP 原生 DNS "
+                    "以保证网络可用" % msg3, logging.ERROR)
+        except Exception as e:
+            log("dns guard err: " + str(e), logging.WARNING)
+
+
 # ====================== 核心操作 ======================
 def enable_split():
     """按当前分路模式启用。route_mode=proxy 时走 Proxy 分路(不开 TUN)。"""
@@ -1484,6 +2103,25 @@ def enable_split():
             raise RuntimeError("分流规则写入失败: " + msg)
         log("规则就绪 -> " + msg)
 
+        # ---- 在连接之前把 DNS 分流装好 ----
+        # 顺序有讲究: `dns fallback add` 属于「设置变更」, WARP 收到会把隧道
+        # 以 "Settings Changed" 为由断掉(实测确认)。所以趁现在还断着把后缀
+        # 和网卡 DNS 都写好, 再 connect —— 一次连上即可, 不用连了又断再连。
+        # 实测: 断开状态下 38 条后缀照样能写进去, 连上后 3 秒 fallback 服务器
+        # 就变成 127.0.0.1。
+        if settings.get("smart_dns", True):
+            with state_lock:
+                state["progress"] = {"total": 0, "done": 0,
+                                     "phase": "正在接管 DNS 解析..."}
+            ok_dns, msg_dns = setup_smart_dns(wait_ready=False)
+            with state_lock:
+                state["dns_proxy"] = ok_dns
+            if ok_dns:
+                log("智能 DNS 已装配: " + msg_dns)
+            else:
+                log("智能 DNS 装配失败(保持 WARP 原 DNS): " + msg_dns,
+                    logging.WARNING)
+
         if op_stop.is_set():
             raise RuntimeError("用户取消了操作")
 
@@ -1507,6 +2145,21 @@ def enable_split():
         save_state()
         log(f"分流启用完成: {total} 条规则已就位, daemon 现有排除 "
             f"{len(get_cli_excludes())} 条")
+
+        # 连上之后只需**确认** DNS 分流真正生效(装配已在连接前做完)。
+        # fallback 服务器是 WARP 连着时才有的概念, 所以这一步必须在 connect 之后;
+        # 通常 3 秒内就会出现 127.0.0.1, 等不到也没关系 —— dns_guard_loop 会
+        # 每 30 秒继续修, 这里不因此判失败(否则会把刚建好的隧道又拆掉)。
+        if settings.get("smart_dns", True) and state.get("dns_proxy"):
+            for _ in range(8):
+                time.sleep(3)
+                if DNS_LISTEN_ADDR in dns_fallback_server():
+                    log("智能 DNS 已生效: 国内域名走国内 DNS 拿国内 CDN 节点, "
+                        "境外域名走 " + DNS_WARP + " (经隧道, 无污染)")
+                    break
+            else:
+                log("智能 DNS 尚未被 WARP 确认为 fallback 服务器, "
+                    "守卫线程会继续修复", logging.WARNING)
     except Exception as e:
         log("启用失败: " + str(e), logging.ERROR)
         with state_lock:
@@ -1519,6 +2172,9 @@ def enable_split():
             pass
         with state_lock:
             state["enabled"] = False
+            state["dns_proxy"] = False
+        if settings.get("smart_dns", True):
+            teardown_smart_dns()
     finally:
         with state_lock:
             state["running"] = False
@@ -1547,6 +2203,10 @@ def disable_split():
         state["progress"] = {"total": 0, "done": 0, "phase": "正在关闭分流..."}
     log("开始停用分流...")
     try:
+        # 先撤 DNS 接管再断开, 顺序反了会有一小段「查询转给本地但代理已停」
+        teardown_smart_dns()
+        with state_lock:
+            state["dns_proxy"] = False
         warp(["disconnect"], timeout=20)
         with state_lock:
             state["enabled"] = False
@@ -1605,6 +2265,7 @@ def restore():
         except Exception:
             pass
     stop_bridge()
+    teardown_smart_dns()       # 停代理 + 撤后缀 + 还原网卡 DNS
     try:
         warp(["disconnect"], timeout=20)
         warp(["mode", "warp"], timeout=20)
@@ -1625,6 +2286,8 @@ def restore():
         state["resume_pending"] = False
         state["error"] = None
         state["reconnecting"] = False
+        state["dns_proxy"] = False
+        state["route_active"] = None
         state["progress"] = {"total": 0, "done": 0, "phase": "已还原 (干净状态)"}
     save_state()
     log("已执行一键还原，网络恢复默认")
@@ -1997,6 +2660,20 @@ def reconcile_state_on_startup():
                 ok2, msg = start_bridge()
                 log("Proxy 分路: 重启后自动恢复分流桥 -> " + msg,
                     logging.INFO if ok2 else logging.ERROR)
+            # TUN 分路: 进程重启后本地 DNS 代理没了, 但网卡 DNS 还指着
+            # 127.0.0.1 —— 这个空档期本机是「DNS 全挂」状态, 必须立刻补上。
+            if state["route_active"] == "tun" and settings.get("smart_dns", True):
+                ok3, msg3 = setup_smart_dns()
+                with state_lock:
+                    state["dns_proxy"] = ok3
+                if ok3:
+                    log("TUN 分路: 重启后自动恢复智能 DNS (" + msg3 + ")")
+                else:
+                    # 恢复失败必须把网卡 DNS 还原干净, 否则会留下「指向
+                    # 127.0.0.1 但无监听」的断网隐患
+                    log("TUN 分路: 智能 DNS 恢复失败(" + msg3 +
+                        "), 已整体还原", logging.WARNING)
+                    teardown_smart_dns()
             log(f"已确认上次的分流仍在生效 (WARP 已连接, daemon 排除规则 {n} 条)")
             return
         if settings.get("auto_resume", False):
@@ -2321,19 +2998,50 @@ def detect_zerotrust():
 
 
 # ====================== 状态查询 ======================
+# /api/status 每 1.5 秒被前端轮询一次, 而每个 warp-cli 调用都要新起一个进程。
+# 其中 `tunnel ip list` 会把 5440 条规则全打出来(最慢), `settings` 次之。
+# 这两项变化频率极低, 用短 TTL 缓存掉能显著降低轮询开销。
+_SLOW_CACHE = {"mode": ("unknown", 0), "cli_count": (0, 0), "ts": 0}
+
+
+def _cached_mode(ttl=10):
+    ts = _SLOW_CACHE["mode"][1]
+    if time.time() - ts < ttl:
+        return _SLOW_CACHE["mode"][0]
+    mode = "unknown"
+    try:
+        ok2, setout = warp(["settings"], timeout=10)
+        for ln in setout.splitlines():
+            if "Mode:" in ln:
+                m = ln.split("Mode:")[-1].strip()
+                if m:
+                    mode = m
+                    break
+    except Exception:
+        pass
+    _SLOW_CACHE["mode"] = (mode, time.time())
+    return mode
+
+
+def _cached_cli_count(ttl=15):
+    ts = _SLOW_CACHE["cli_count"][1]
+    if time.time() - ts < ttl:
+        return _SLOW_CACHE["cli_count"][0]
+    n = 0
+    try:
+        ok3, listout = warp(["tunnel", "ip", "list"], timeout=15)
+        n = listout.count("(CLI exclude)")
+    except Exception:
+        pass
+    _SLOW_CACHE["cli_count"] = (n, time.time())
+    return n
+
+
 def get_status():
     ok, out = warp(["status"], timeout=10)
     connected = "Connected" in out
-    ok2, setout = warp(["settings"], timeout=10)
-    mode = "unknown"
-    for ln in setout.splitlines():
-        if "Mode:" in ln:
-            m = ln.split("Mode:")[-1].strip()
-            if m:
-                mode = m
-                break
-    ok3, listout = warp(["tunnel", "ip", "list"], timeout=10)
-    cli_count = listout.count("(CLI exclude)")
+    mode = _cached_mode()
+    cli_count = _cached_cli_count()
     egress = get_egress_ip()
     with state_lock:
         if state["enabled"] and not connected and "Disconnected" not in out and "Failure" not in out:
@@ -2382,6 +3090,11 @@ def get_status():
             "proxy_port": int(settings.get("proxy_port", 40000)),
             "system_proxy": settings.get("system_proxy", False),
             "sysproxy_on": state.get("sysproxy_on", False),
+            "smart_dns": settings.get("smart_dns", True),
+            "dns_proxy": state.get("dns_proxy", False),
+            "dns_stats": dict(dns_stats),
+            "nic_dns": read_nic_dns() if _IS_WIN else [],
+            "dns_fallback": _cached_fallback_server(),
             "bridge_stats": dict(bridge_stats),
             "latency_cn": metrics["latency_cn"],
             "latency_intl": metrics["latency_intl"],
@@ -2860,13 +3573,20 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/settings":
             for k in ("theme", "auto_reconnect", "auto_heal", "auto_update",
                       "auto_resume", "metrics_speed", "tray",
-                      "proxy_port", "bridge_port", "system_proxy"):
+                      "proxy_port", "bridge_port", "system_proxy",
+                      "smart_dns"):
                 if k in payload:
                     settings[k] = payload[k]
             save_settings()
             # 端口变了要重启分流桥才生效
             if state.get("bridge_up") and ("bridge_port" in payload or "proxy_port" in payload):
                 threading.Thread(target=start_bridge, daemon=True).start()
+            # 智能 DNS 开关即时生效(仅在 TUN 分流已启用时有意义)
+            if "smart_dns" in payload:
+                # 放后台线程: 装配/拆卸会触发 WARP 断线并需要重连, 不能卡住请求
+                threading.Thread(target=toggle_smart_dns,
+                                 args=(bool(payload["smart_dns"]),),
+                                 daemon=True).start()
             self._json({"ok": True, "settings": settings})
         elif p == "/api/route":
             mode = payload.get("mode", "tun")
@@ -3013,12 +3733,18 @@ def main():
     else:
         log(f"未找到 WARP 配置 {warp_conf_path()}, 将使用逐条注入(较慢)", logging.WARNING)
 
+    # 兜底: 任何方式的退出(含未捕获异常)都必须撤掉 DNS 接管。
+    # 否则网卡 DNS 会一直指向 127.0.0.1 而 53 端口无人监听 —— 用户直接断网。
+    # atexit 挡不住 taskkill -f, 但能覆盖绝大多数正常/异常退出路径。
+    atexit.register(_atexit_restore_dns)
+
     # 启动后台守护线程
     threading.Thread(target=metrics_loop, daemon=True).start()
     threading.Thread(target=reconnect_loop, daemon=True).start()
     threading.Thread(target=self_heal_loop, daemon=True).start()
     threading.Thread(target=autoupdate_loop, daemon=True).start()
     threading.Thread(target=egress_loop, daemon=True).start()
+    threading.Thread(target=dns_guard_loop, daemon=True).start()
     # 校对上次留下的 enabled 标志, 避免"一启动就自己动网络"
     threading.Thread(target=reconcile_state_on_startup, daemon=True).start()
 
@@ -3068,6 +3794,13 @@ def main():
         log("收到退出信号")
     finally:
         EXIT_EVENT.set()
+        # 退出前必须撤掉 DNS 接管。不撤的话网卡 DNS 会一直指向 127.0.0.1,
+        # 而本进程已死、53 端口没人监听 —— 命中后缀的域名全部解析失败,
+        # 表现就是"能上微信但打不开网页"。这个后果比不分流严重得多,
+        # 所以这里无条件检查一次(不只看 dns_proxy 标志位)。
+        if state.get("dns_proxy") or _DNS_SERVER is not None:
+            teardown_smart_dns()
+            log("退出前已还原网卡 DNS 与 WARP fallback 设置")
         server.shutdown()
         save_state()
 

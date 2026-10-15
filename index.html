@@ -89,6 +89,10 @@
   .routedesc{margin-top:10px;font-size:12px;color:var(--sub);line-height:1.7}
   .routedesc b{color:var(--txt);font-weight:600}
   .portbox{margin-top:12px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+  .dnsnote{margin-top:8px;font-size:12px;color:var(--sub);line-height:1.7;display:none}
+  .dnsnote.show{display:block}
+  .dnsnote.warn{color:var(--warn,#f5a524)}
+  .dnsnote b{color:var(--txt);font-weight:600}
   .rules .list{max-height:160px;overflow-y:auto;margin-bottom:10px}
   .rule{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;margin-bottom:6px;font-size:13px}
   .rule .meta{color:var(--sub);font-size:11px}
@@ -158,6 +162,17 @@
         <div class="row" style="margin-top:10px">
           <div><div>写入系统代理</div><div class="desc">让不认 SOCKS 的普通应用也走分流；局域网与 localhost 自动绕过</div></div>
           <div class="tswitch" id="swSysProxy"></div>
+        </div>
+      </div>
+      <div class="portbox" id="tunBox">
+        <div class="kv"><span class="k">本地 DNS 代理</span><span class="val" id="kvDns">—</span></div>
+        <div class="kv"><span class="k">解析 国内 / 境外</span><span class="val" id="kvDnsStat">—</span></div>
+        <div class="kv"><span class="k">WARP 交给谁解析</span><span class="val" id="kvFbSrv">—</span></div>
+        <div class="kv"><span class="k">网卡 DNS（参考）</span><span class="val" id="kvNicDns">—</span></div>
+        <div class="dnsnote" id="dnsNote"></div>
+        <div class="row" style="margin-top:10px">
+          <div><div>智能 DNS 分流</div><div class="desc">WARP 把 DNS 经隧道送出境，国内 CDN 因此把你当境外用户、返回海外节点 —— 这是分流后带宽跑不满的主因（实测国内镜像：海外节点 80 Mbps / 首包 2.4s，国内节点 183 Mbps / 首包 0.08s）。开启后本地代理按域名分流解析</div></div>
+          <div class="tswitch" id="swSmartDns"></div>
         </div>
       </div>
     </div>
@@ -387,6 +402,28 @@ function setStatus(st){
     ((bs.errors?(" · 失败 "+bs.errors):""));
   setToggle("swSysProxy", !!st.system_proxy);
 
+  // ---- 智能 DNS 分流 (仅 TUN 分路有意义) ----
+  $("tunBox").style.display = isProxy ? "none" : "";
+  setToggle("swSmartDns", st.smart_dns !== false);
+  $("kvDns").textContent = st.dns_proxy
+    ? "127.0.0.1:53 · 已接管"
+    : (st.smart_dns===false ? "已关闭" : (st.enabled ? "启动中…" : "未运行"));
+  const fb = (st.dns_fallback||"").replace(/^Default Fallbacks:\s*/i,"").trim();
+  $("kvFbSrv").textContent = fb || "—";
+  const nd = st.nic_dns||[];
+  $("kvNicDns").textContent = nd.length ? nd.join("  |  ") : "—";
+  const ds = st.dns_stats||{};
+  $("kvDnsStat").textContent = (ds.cn||0) + " / " + (ds.warp||0) +
+    ((ds.errors?(" · 异常 "+ds.errors):""));
+  const dn = $("dnsNote");
+  if(!isProxy && st.enabled && st.smart_dns!==false && !st.dns_proxy){
+    dn.className="dnsnote show warn";
+    dn.innerHTML="<b>⚠ DNS 仍在 WARP 手里</b>：国内 CDN 会按境外来源返回海外节点，流量绕一圈再回来 —— 这就是带宽跑不满的原因。请检查上方是否显示「已接管」。";
+  } else if(!isProxy && st.dns_proxy){
+    dn.className="dnsnote show";
+    dn.innerHTML="<b>✓ 已接管</b>：国内域名用国内 DNS 解析（拿到国内 CDN 节点，走直连），境外域名走公网 DNS 经隧道查询（不会被污染）。";
+  } else { dn.className="dnsnote"; }
+
   // 设置开关同步
   setToggle("swReconnect", st.auto_reconnect);
   setToggle("swAutoHeal", st.auto_heal);
@@ -548,6 +585,13 @@ $("swSysProxy").addEventListener("click",function(){
   postJSON("/api/system-proxy",{on:on}).then(r=>{
     toast(on?"已把分流桥写入系统代理（局域网已绕过）":"已还原系统代理设置");
     loadStatus();
+  });
+});
+$("swSmartDns").addEventListener("click",function(){
+  const on=!this.classList.contains("on"); setToggle("swSmartDns",on);
+  postJSON("/api/settings",{smart_dns:on}).then(r=>{
+    toast(on?"已开启智能 DNS 分流：国内域名解析到国内节点":"已关闭智能 DNS 分流，网卡 DNS 还原");
+    setTimeout(loadStatus,1200);
   });
 });
 $("swAutoResume").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swAutoResume",on); postJSON("/api/settings",{auto_resume:on}); toast(on?"程序启动时会自动恢复上次的分流状态":"程序启动后不会自己动网络"); });
