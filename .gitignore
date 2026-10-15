@@ -1,0 +1,9 @@
+# 运行时产物（自动生成，含本机状态/日志，勿提交）
+state.json
+warp_split.log
+__pycache__/
+*.pyc
+.venv/
+*.log
+.DS_Store
+Thumbs.db

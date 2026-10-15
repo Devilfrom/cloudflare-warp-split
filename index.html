@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cloudflare WARP 智能分流控制台</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2330; --border:#2a3140;
+    --txt:#e6edf3; --sub:#8b949e; --accent:#3b82f6; --green:#22c55e;
+    --red:#ef4444; --amber:#f59e0b; --mono:#39d353;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;padding:24px}
+  .wrap{max-width:920px;margin:0 auto}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:20px}
+  header .logo{width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,#f38020,#3b82f6);display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:20px}
+  header h1{font-size:20px;font-weight:700}
+  header .v{font-size:12px;color:var(--sub);margin-top:2px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px}
+  .card h2{font-size:13px;color:var(--sub);font-weight:600;margin-bottom:12px;letter-spacing:.3px}
+  .status-pill{display:inline-flex;align-items:center;gap:8px;font-size:15px;font-weight:700;padding:8px 14px;border-radius:999px}
+  .dot{width:10px;height:10px;border-radius:50%}
+  .s-off{background:rgba(139,148,158,.15);color:var(--sub)} .s-off .dot{background:var(--sub)}
+  .s-on{background:rgba(34,197,94,.15);color:var(--green)} .s-on .dot{background:var(--green)}
+  .s-run{background:rgba(245,158,11,.15);color:var(--amber)} .s-run .dot{background:var(--amber);animation:pulse 1s infinite}
+  .s-err{background:rgba(239,68,68,.15);color:var(--red)} .s-err .dot{background:var(--red)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .kv{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;border-bottom:1px dashed var(--border)}
+  .kv:last-child{border-bottom:none}
+  .kv .k{color:var(--sub)} .kv .val{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
+  .toggle-card{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px}
+  .switch{position:relative;width:160px;height:64px;border-radius:999px;background:var(--panel2);border:1px solid var(--border);cursor:pointer;transition:.25s;user-select:none}
+  .switch .knob{position:absolute;top:5px;left:5px;width:54px;height:54px;border-radius:50%;background:#fff;transition:.25s;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#333}
+  .switch.on{background:linear-gradient(135deg,#16a34a,#22c55e)}
+  .switch.on .knob{left:101px;background:#fff;color:#16a34a}
+  .switch.disabled{opacity:.45;cursor:not-allowed}
+  .switch-label{font-size:15px;font-weight:700}
+  .progress{width:100%;height:10px;background:var(--panel2);border-radius:999px;overflow:hidden;margin-top:6px}
+  .progress > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .3s}
+  .phase{font-size:12px;color:var(--sub);margin-top:6px;text-align:center;min-height:16px}
+  .btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:4px}
+  button{font-family:inherit;font-size:13px;font-weight:600;color:var(--txt);background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px 14px;cursor:pointer;transition:.15s}
+  button:hover{border-color:var(--accent)}
+  button:active{transform:translateY(1px)}
+  button.danger{color:#fff;background:rgba(239,68,68,.18);border-color:rgba(239,68,68,.5)}
+  button.danger:hover{background:rgba(239,68,68,.32)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  .logcard{grid-column:1 / -1}
+  .log{background:#0a0d12;border:1px solid var(--border);border-radius:10px;height:220px;overflow-y:auto;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.6;color:var(--mono)}
+  .log .err{color:#ff7b72}
+  .footer{margin-top:14px;font-size:12px;color:var(--sub);text-align:center;line-height:1.7}
+  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--panel);border:1px solid var(--border);padding:10px 18px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:.3s}
+  .toast.show{opacity:1}
+  .banner{display:none;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.5);color:#ffb4ab;border-radius:12px;padding:16px 18px;margin-bottom:16px;font-size:13px;line-height:1.8}
+  .banner.show{display:block}
+  .banner b{color:#ff8a7f}
+  .banner code{background:#0a0d12;padding:1px 6px;border-radius:5px;color:#ffd9a8}
+  @media(max-width:680px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">W</div>
+    <div>
+      <h1>Cloudflare WARP 智能分流控制台</h1>
+      <div class="v">国际流量走 WARP 出口 · 国内流量直连 · 一键开关 / 一键还原</div>
+    </div>
+  </header>
+
+  <div class="banner" id="banner"></div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>运行状态</h2>
+      <div id="statusPill" class="status-pill s-off"><span class="dot"></span><span id="statusText">未启用</span></div>
+      <div style="margin-top:14px">
+        <div class="kv"><span class="k">WARP 连接</span><span class="val" id="kvConn">—</span></div>
+        <div class="kv"><span class="k">当前模式</span><span class="val" id="kvMode">—</span></div>
+        <div class="kv"><span class="k">出口 IP</span><span class="val" id="kvEgress">—</span></div>
+        <div class="kv"><span class="k">已注入国内规则</span><span class="val" id="kvCli">—</span></div>
+        <div class="kv"><span class="k">规则库总量</span><span class="val" id="kvTotal">—</span></div>
+      </div>
+    </div>
+
+    <div class="card toggle-card">
+      <h2 style="align-self:flex-start">分流开关</h2>
+      <div id="switch" class="switch disabled"><div class="knob">OFF</div></div>
+      <div class="switch-label" id="switchLabel">点击启用</div>
+      <div class="progress"><i id="progBar"></i></div>
+      <div class="phase" id="phase">空闲</div>
+    </div>
+
+    <div class="card">
+      <h2>操作</h2>
+      <div class="btns">
+        <button id="btnRefresh">刷新状态</button>
+        <button id="btnUpdateList">更新中国IP列表</button>
+        <button id="btnSelfTest">分流自检</button>
+        <button id="btnFixIpv6">修复IPv6</button>
+        <button id="btnDisable">停用分流</button>
+        <button id="btnRestore" class="danger">一键还原</button>
+      </div>
+      <div style="margin-top:12px;font-size:12px;color:var(--sub);line-height:1.7">
+        启用后：国际流量经 WARP 加密出口，国内网站/游戏直连。<br>
+        停用 / 一键还原：断开 WARP 并清空分流规则，<b>网络立即恢复正常</b>。
+      </div>
+    </div>
+
+    <div class="card logcard" id="selfTestCard" style="display:none">
+      <h2>分流自检结果 <span style="font-size:11px;color:var(--sub)">（验证国际是否走 WARP、国内是否直连）</span></h2>
+      <div id="selfTestBody"></div>
+    </div>
+
+    <div class="card logcard">
+      <h2>运行日志</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+
+  <div class="footer">
+    需以<b>管理员身份</b>运行（run.bat 会自动提权）。规则库来自 APNIC 中国大陆 IPv4 分配，定期点「更新中国IP列表」可保持最新。<br>
+    如遇异常，随时点「一键还原」即可回到干净网络状态。
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+// ---- 防呆：检测是否用 file:// 直接打开 ----
+if (location.protocol === "file:") {
+  document.body.innerHTML =
+    '<div style="max-width:780px;margin:80px auto;background:#161b22;border:1px solid #2a3140;border-radius:14px;padding:30px;color:#e6edf3;font-family:sans-serif;line-height:1.9">'+
+    '<h1 style="color:#ef4444;margin-bottom:14px">检测到你以 file:// 方式打开了本页面</h1>'+
+    '<p>这样前端无法连接本地后端服务，点击按钮就会报「请求失败」。</p>'+
+    '<p><b>正确做法：</b>直接双击 <code style="background:#0a0d12;padding:2px 8px;border-radius:6px">run.bat</code>，它会自动以管理员身份启动服务，并在浏览器打开 '+
+    '<code style="background:#0a0d12;padding:2px 8px;border-radius:6px">http://127.0.0.1:8777/</code>。请不要手动双击 index.html。</p>'+
+    '</div>';
+  throw new Error("opened via file://");
+}
+
+const $ = id => document.getElementById(id);
+let lastPhase = "";
+let curEnabled = false, curConnected = false, busy = false, connFails = 0;
+
+function toast(msg){
+  const t=$("toast"); t.textContent=msg; t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"),2200);
+}
+function showBanner(){
+  const b=$("banner");
+  b.className="banner show";
+  b.innerHTML =
+    "<b>无法连接本地后端服务 (127.0.0.1:8777)。</b><br>"+
+    "请按顺序排查：<br>"+
+    "① 确认已<b>双击 run.bat</b> 启动（弹出的 UAC 要点「是」），不是直接打开 index.html；<br>"+
+    "② 浏览器地址栏必须是 <code>http://127.0.0.1:8777/</code>，不能是 file:// 开头；<br>"+
+    "③ 若系统/浏览器走了代理，请把 <code>127.0.0.1</code> 加入代理「绕过列表」(或临时关闭代理)；<br>"+
+    "④ 若仍不行，用管理员打开 PowerShell 运行 <code>netstat -ano | findstr 8777</code> 看端口是否被占用。";
+}
+function hideBanner(){ $("banner").className="banner"; }
+
+function setStatus(st){
+  const pill=$("statusPill"), txt=$("statusText");
+  pill.className="status-pill";
+  if(st.error){ pill.classList.add("s-err"); txt.textContent="异常"; }
+  else if(st.running){ pill.classList.add("s-run"); txt.textContent="操作中..."; }
+  else if(st.enabled && st.connected){ pill.classList.add("s-on"); txt.textContent="分流中"; }
+  else { pill.classList.add("s-off"); txt.textContent="未启用"; }
+
+  $("kvConn").textContent = st.connected ? "已连接" : "未连接";
+  $("kvMode").textContent = st.mode || "—";
+  $("kvEgress").textContent = (st.egress_ip||"")==="获取失败" ? "获取失败" : (st.egress_ip || "—");
+  $("kvCli").textContent = st.cli_exclude_count!=null ? st.cli_exclude_count+" 条" : "—";
+  $("kvTotal").textContent = st.list_total!=null ? st.list_total+" 条" : "—";
+
+  curEnabled = !!st.enabled; curConnected = !!st.connected; busy = !!st.running;
+
+  const sw=$("switch");
+  sw.classList.toggle("on", curEnabled && curConnected);
+  sw.classList.toggle("disabled", busy);
+  $("switchLabel").textContent = busy ? "处理中..." : (curEnabled && curConnected ? "点击停用" : "点击启用");
+  $("switch").querySelector(".knob").textContent = (curEnabled && curConnected) ? "ON" : "OFF";
+
+  const p=st.progress||{};
+  const total=p.total||0, done=p.done||0;
+  const pct = total>0 ? Math.round(done/total*100) : (busy?30:0);
+  $("progBar").style.width = pct+"%";
+  const phaseTxt = p.phase || (st.error? ("错误: "+st.error) : "空闲");
+  if(phaseTxt!==lastPhase){ $("phase").textContent = phaseTxt; lastPhase=phaseTxt; }
+}
+
+function loadStatus(){
+  fetch("/api/status").then(r=>r.json()).then(st=>{
+    connFails=0; hideBanner(); setStatus(st);
+  }).catch(()=>{
+    connFails++; if(connFails>=2) showBanner();
+  });
+}
+function loadLog(){
+  fetch("/api/log").then(r=>r.json()).then(d=>{
+    const el=$("log"); const lines=d.log||[];
+    el.innerHTML = lines.map(l=>{
+      const cls = /失败|错误|异常|ERROR/.test(l) ? "err" : "";
+      return "<div class='"+cls+"'>"+l.replace(/</g,"&lt;")+"</div>";
+    }).join("");
+    el.scrollTop = el.scrollHeight;
+  }).catch(()=>{});
+}
+
+function post(path,btn){
+  fetch(path,{method:"POST"}).then(r=>r.json()).then(d=>{
+    if(d.msg) toast(d.msg);
+    if(btn) btn.disabled=false;
+    loadStatus(); loadLog();
+  }).catch(()=>toast("请求失败：无法连接本地服务 127.0.0.1:8777"));
+}
+
+$("switch").addEventListener("click",()=>{
+  if(busy) return;
+  if(curEnabled && curConnected){
+    post("/api/disable"); toast("正在停用分流...");
+  }else{
+    post("/api/enable"); toast("正在启用分流，请稍候...");
+  }
+});
+$("btnRefresh").addEventListener("click",()=>{loadStatus();loadLog();toast("已刷新");});
+$("btnUpdateList").addEventListener("click",function(){this.disabled=true;post("/api/refresh",this);toast("正在更新中国IP列表...");});
+$("btnDisable").addEventListener("click",function(){this.disabled=true;post("/api/disable",this);toast("正在停用分流...");});
+$("btnRestore").addEventListener("click",function(){this.disabled=true;post("/api/restore",this);toast("正在一键还原...");});
+$("btnSelfTest").addEventListener("click",function(){
+  this.disabled=true; const t=this.textContent; this.textContent="自检中...";
+  fetch("/api/selftest").then(r=>r.json()).then(d=>{
+    renderSelfTest(d); toast("自检完成：" + d.verdict);
+  }).catch(()=>{ toast("自检失败：无法连接本地服务"); }).finally(()=>{
+    this.disabled=false; this.textContent=t;
+  });
+});
+$("btnFixIpv6").addEventListener("click",function(){
+  this.disabled=true;
+  fetch("/api/fix_ipv6",{method:"POST"}).then(r=>r.json()).then(d=>{
+    toast(d.msg || (d.ok ? "已执行 IPv6 修复" : "IPv6 修复失败"));
+  }).catch(()=>{ toast("请求失败：无法连接本地服务"); }).finally(()=>{
+    setTimeout(()=>{this.disabled=false;}, 1500);
+  });
+});
+
+function row(k,v,ok){
+  const c = ok===true?"var(--green)":(ok===false?"var(--red)":"var(--sub)");
+  return '<div class="kv"><span class="k">'+k+'</span><span class="val" style="color:'+c+'">'+v+'</span></div>';
+}
+function renderSelfTest(d){
+  const card=$("selfTestCard"); card.style.display="block";
+  const v=d.verdict;
+  const vcolor = v==="PASS"?"var(--green)":(v==="FAIL"?"var(--red)":"var(--amber)");
+  const cn=d.china_test||{}, fx=d.foreign_test||{};
+  const conn = d.connected===true, cf = d.egress_via_warp===true, cli = (d.cli_exclude_count||0)>0;
+  const cnok = cn.direct===true, fxok = fx.via_warp===true;
+  $("selfTestBody").innerHTML =
+    '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">'+
+      '<span style="font-size:22px;font-weight:800;color:'+vcolor+'">'+v+'</span>'+
+      (d.msg?'<span style="font-size:12px;color:var(--sub)">'+d.msg+'</span>':'')+
+    '</div>'+
+    row("WARP 已连接", d.connected?"是":"否", conn)+
+    row("出口 IP / 归属", (d.egress_ip||"—")+(cf?" · Cloudflare ✅":" · 非Cloudflare ⚠"), cf)+
+    row("已注入国内规则", (d.cli_exclude_count!=null?d.cli_exclude_count+" 条":"—"), cli)+
+    row("中国IP "+cn.ip+" 首跳", (cn.first_hop||"无")+(cnok?" · 直连 ✅":" · 非直连 ⚠"), cnok)+
+    row("外国IP "+fx.ip+" 首跳", (fx.first_hop||"无")+(fxok?" · 走WARP ✅":" · 未走WARP ⚠"), fxok);
+}
+
+setInterval(()=>{loadStatus();loadLog();}, 1500);
+loadStatus(); loadLog();
+</script>
+</body>
+</html>
