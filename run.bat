@@ -12,5 +12,5 @@ if not exist "%SCRIPT%" (
 set "PY=C:\Users\Administrator\.workbuddy\binaries\python\versions\3.13.12\python.exe"
 if not exist "%PY%" set "PY=python"
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$port=8777; $listening=(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue).Count -gt 0; if(-not $listening){ Start-Process -FilePath '%PY%' -ArgumentList '\"%SCRIPT%\"' -Verb RunAs; $t=0; while($t -lt 30 -and -not (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)){ Start-Sleep -Seconds 1; $t++ } }; Start-Process ('http://127.0.0.1:'+$port+'/')"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$port=8777; $conn=Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue; if($conn){ Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue; Write-Host 'Stopped previous instance on port '$port; Start-Sleep -Seconds 2 }; Start-Process -FilePath '%PY%' -ArgumentList '\"%SCRIPT%\"' -Verb RunAs; $t=0; while($t -lt 30 -and -not (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)){ Start-Sleep -Seconds 1; $t++ }; Start-Process ('http://127.0.0.1:'+$port+'/')"
 exit /b 0
