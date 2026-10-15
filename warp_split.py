@@ -1053,9 +1053,74 @@ def get_status():
 
 
 # ====================== 系统托盘 (ctypes, 零依赖) ======================
+_WIN32_INITED = False
+
+
+def _init_win32():
+    """声明 Win32 函数原型。
+    不声明时 ctypes 默认把返回值当 32 位 int, 在 64 位 Windows 上会截断 HICON/HWND/HMENU
+    等指针型句柄, 导致图标创建失败或崩溃。因此必须显式设置 restype/argtypes。"""
+    global _WIN32_INITED
+    if _WIN32_INITED:
+        return
+    _WIN32_INITED = True
+    u = ctypes.windll.user32
+    g = ctypes.windll.gdi32
+    s = ctypes.windll.shell32
+    k = ctypes.windll.kernel32
+    P, I, U = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint
+
+    u.DefWindowProcW.restype = ctypes.c_ssize_t
+    u.DefWindowProcW.argtypes = [P, U, ctypes.c_size_t, ctypes.c_ssize_t]
+    u.CreateWindowExW.restype = P
+    u.CreateWindowExW.argtypes = [U, ctypes.c_wchar_p, ctypes.c_wchar_p, U,
+                                  I, I, I, I, P, P, P, P]
+    u.RegisterClassW.restype = ctypes.c_ushort
+    u.RegisterClassW.argtypes = [P]
+    u.CreatePopupMenu.restype = P
+    u.AppendMenuW.argtypes = [P, U, ctypes.c_size_t, ctypes.c_wchar_p]
+    u.AppendMenuW.restype = I
+    u.TrackPopupMenu.argtypes = [P, U, I, I, I, P, P]
+    u.TrackPopupMenu.restype = I
+    u.DestroyMenu.argtypes = [P]
+    u.DestroyMenu.restype = I
+    u.SetForegroundWindow.argtypes = [P]
+    u.SetForegroundWindow.restype = I
+    u.PostMessageW.argtypes = [P, U, ctypes.c_size_t, ctypes.c_ssize_t]
+    u.PostMessageW.restype = I
+    u.PostQuitMessage.argtypes = [I]
+    u.GetMessageW.argtypes = [P, P, U, U]
+    u.GetMessageW.restype = I
+    u.TranslateMessage.argtypes = [P]
+    u.DispatchMessageW.argtypes = [P]
+    u.LoadIconW.restype = P
+    u.LoadIconW.argtypes = [P, P]
+    u.DestroyIcon.argtypes = [P]
+    u.DestroyIcon.restype = I
+    u.GetDC.restype = P
+    u.ReleaseDC.argtypes = [P, P]
+    u.CreateIconIndirect.restype = P
+    u.CreateIconIndirect.argtypes = [P]
+
+    g.CreateCompatibleBitmap.restype = P
+    g.CreateCompatibleBitmap.argtypes = [P, I, I]
+    g.CreateBitmap.restype = P
+    g.CreateBitmap.argtypes = [I, I, U, U, P]
+    g.SetDIBits.argtypes = [P, P, U, U, P, P, U]
+    g.DeleteObject.argtypes = [P]
+    g.DeleteObject.restype = I
+
+    # 关键: Shell_NotifyIconW 位于 shell32.dll, 不在 user32.dll
+    s.Shell_NotifyIconW.restype = I
+    s.Shell_NotifyIconW.argtypes = [U, P]
+    k.GetModuleHandleW.restype = P
+    k.GetLastError.restype = U
+
+
 def make_hicon(rgb):
     """用 ctypes 生成一个纯色圆形 HICON。失败返回 0。"""
     try:
+        _init_win32()
         user32 = ctypes.windll.user32
         gdi32 = ctypes.windll.gdi32
         kernel32 = ctypes.windll.kernel32
@@ -1090,7 +1155,8 @@ def make_hicon(rgb):
             _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", ctypes.c_ulong * 1)]
 
         class ICONINFO(ctypes.Structure):
-            _fields_ = [("fIcon", ctypes.c_bool), ("xHotspot", ctypes.c_ulong),
+            # fIcon 在 Win32 中是 BOOL(4 字节), 用 c_bool(1 字节) 会导致结构体布局错位
+            _fields_ = [("fIcon", ctypes.c_int), ("xHotspot", ctypes.c_ulong),
                         ("yHotspot", ctypes.c_ulong), ("hbmMask", ctypes.c_void_p),
                         ("hbmColor", ctypes.c_void_p)]
 
@@ -1122,122 +1188,146 @@ def make_hicon(rgb):
 
 
 class TrayApp:
-    WM_SHELL = 0x400 + 1  # WM_USER + 1
+    WM_SHELL = 0x0400 + 1  # WM_USER + 1
     MSG_OPEN, MSG_ENABLE, MSG_DISABLE, MSG_FIX, MSG_EXIT = 1, 2, 3, 4, 5
+    CLASS_NAME = "WarpSplitTray"
+    UID = 1
+    NIM_ADD, NIM_MODIFY, NIM_DELETE = 0x0, 0x1, 0x2
+    NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
 
     def __init__(self, url):
+        _init_win32()
         self.url = url
         self.hwnd = 0
         self.hicon = 0
         self.hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
-        self.wndclass = None
         self.wndproc = None
+        self._tip = "Cloudflare WARP 智能分流 (未启用)"
+        self._nid_cls = self._make_nid_class()
+
+    @staticmethod
+    def _make_nid_class():
+        class NOTIFYICONDATAW(ctypes.Structure):
+            # 仅声明到 szTip, cbSize 自动等于 NOTIFYICONDATAW_V1_SIZE(=296), 为系统认可的合法尺寸
+            _fields_ = [("cbSize", ctypes.c_uint32), ("hWnd", ctypes.c_void_p),
+                        ("uID", ctypes.c_uint32), ("uFlags", ctypes.c_uint32),
+                        ("uCallbackMessage", ctypes.c_uint32), ("hIcon", ctypes.c_void_p),
+                        ("szTip", ctypes.c_wchar * 128)]
+        return NOTIFYICONDATAW
+
+    def _nid(self, flags, tip=None):
+        N = self._nid_cls
+        nid = N()
+        nid.cbSize = ctypes.sizeof(N)
+        nid.hWnd = self.hwnd
+        nid.uID = self.UID
+        nid.uFlags = flags
+        nid.uCallbackMessage = self.WM_SHELL
+        nid.hIcon = self.hicon
+        if tip is not None:
+            nid.szTip = tip[:127]
+        return nid
 
     def create(self):
         user32 = ctypes.windll.user32
-        WM_DESTROY = 2
+        kernel32 = ctypes.windll.kernel32
+        WM_DESTROY = 0x0002
         WM_COMMAND = 0x0111
 
-        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p)
+        # LRESULT 是 LONG_PTR(64 位下 8 字节), 用 c_long 会截断 DefWindowProcW 的返回值
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p,
+                                     ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
 
         def wndproc(hwnd, msg, wparam, lparam):
-            if msg == self.WM_SHELL:
-                event = lparam & 0xFFFF
-                if event == 0x0203:  # WM_LBUTTONDBLCLK
-                    self._open()
-                elif event == 0x0205:  # WM_RBUTTONUP
-                    self._show_menu()
-                return 0
-            if msg == WM_COMMAND:
-                cmd = wparam & 0xFFFF
-                self._menu(cmd)
-                return 0
-            if msg == WM_DESTROY:
-                user32.PostQuitMessage(0)
-                return 0
+            try:
+                if msg == self.WM_SHELL:
+                    event = lparam & 0xFFFF
+                    if event == 0x0203:      # WM_LBUTTONDBLCLK
+                        self._open()
+                    elif event == 0x0205:    # WM_RBUTTONUP
+                        self._show_menu()
+                    return 0
+                if msg == WM_COMMAND:
+                    self._menu(wparam & 0xFFFF)
+                    return 0
+                if msg == WM_DESTROY:
+                    user32.PostQuitMessage(0)
+                    return 0
+            except Exception as e:
+                log("托盘消息处理异常: " + str(e), logging.DEBUG)
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
         self.wndproc = WNDPROC(wndproc)
-        className = "WarpSplitTray"
-        self.wndclass = ctypes.create_unicode_buffer(className)
 
-        class WNDCLASS(ctypes.Structure):
+        class WNDCLASSW(ctypes.Structure):
             _fields_ = [("style", ctypes.c_uint), ("lpfnWndProc", WNDPROC),
                         ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
                         ("hInstance", ctypes.c_void_p), ("hIcon", ctypes.c_void_p),
                         ("hCursor", ctypes.c_void_p), ("hbrBackground", ctypes.c_void_p),
                         ("lpszMenuName", ctypes.c_wchar_p), ("lpszClassName", ctypes.c_wchar_p)]
 
-        wc = WNDCLASS()
+        wc = WNDCLASSW()
         wc.style = 0
         wc.lpfnWndProc = self.wndproc
         wc.hInstance = self.hinst
-        wc.lpszClassName = self.wndclass
+        # 关键修复: 直接赋 Python str, ctypes 自动转成 c_wchar_p
+        # (原先传 create_unicode_buffer 得到的 c_wchar_Array, 类型不兼容会抛 TypeError)
+        wc.lpszClassName = self.CLASS_NAME
+        wc.lpszMenuName = None
         if not user32.RegisterClassW(ctypes.byref(wc)):
-            return False
-        self.hwnd = user32.CreateWindowExW(0, self.wndclass, "WARP", 0, 0, 0, 0, 0,
-                                           0, 0, self.hinst, 0)
+            err = kernel32.GetLastError()
+            if err != 1410:  # ERROR_CLASS_ALREADY_EXISTS: 同一进程重复注册, 可继续
+                log(f"托盘: RegisterClassW 失败 (GetLastError={err})", logging.WARNING)
+                return False
+
+        # HWND_MESSAGE: 创建纯消息窗口(不可见), 更轻量
+        hwnd_message = ctypes.c_void_p(-3)
+        self.hwnd = user32.CreateWindowExW(0, self.CLASS_NAME, self.CLASS_NAME, 0,
+                                           0, 0, 0, 0, hwnd_message, 0, self.hinst, 0)
         if not self.hwnd:
+            log(f"托盘: CreateWindowExW 失败 (GetLastError={kernel32.GetLastError()})",
+                logging.WARNING)
             return False
-        self._register_icon()
-        return True
+        return self._register_icon()
 
     def _register_icon(self):
         user32 = ctypes.windll.user32
-        self.hicon = make_hicon((34, 197, 94))
+        if not self.hicon:
+            self.hicon = make_hicon((239, 68, 68))
         if not self.hicon:
             self.hicon = user32.LoadIconW(0, 32516)  # IDI_INFORMATION 兜底
-
-        class NOTIFYICONDATA(ctypes.Structure):
-            _fields_ = [("cbSize", ctypes.c_ulong), ("hWnd", ctypes.c_void_p),
-                        ("uID", ctypes.c_uint), ("uFlags", ctypes.c_ulong),
-                        ("uCallbackMessage", ctypes.c_ulong), ("hIcon", ctypes.c_void_p),
-                        ("szTip", ctypes.c_wchar * 128)]
-
-        nid = NOTIFYICONDATA()
-        nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
-        nid.hWnd = self.hwnd
-        nid.uID = 1
-        nid.uFlags = 0x7  # NIF_MESSAGE | NIF_ICON | NIF_TIP
-        nid.uCallbackMessage = self.WM_SHELL
-        nid.hIcon = self.hicon
-        tip = "Cloudflare WARP 智能分流 (未启用)"
-        ctypes.memmove(ctypes.addressof(nid.szTip), ctypes.create_unicode_buffer(tip), len(tip) * 2)
-        user32.Shell_NotifyIconW(0x0, ctypes.byref(nid))  # NIM_ADD
+        nid = self._nid(self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP, self._tip)
+        shell32 = ctypes.windll.shell32
+        if not shell32.Shell_NotifyIconW(self.NIM_ADD, ctypes.byref(nid)):
+            log("托盘: Shell_NotifyIconW(NIM_ADD) 失败", logging.WARNING)
+            return False
+        return True
 
     def update(self, connected, enabled):
         if not self.hwnd:
             return
         user32 = ctypes.windll.user32
-        if self.hicon:
-            user32.DestroyIcon(self.hicon)
-        color = (34, 197, 94) if (enabled and connected) else ((245, 158, 11) if state.get("running") else (239, 68, 68))
-        self.hicon = make_hicon(color) or user32.LoadIconW(0, 32516)
-
-        class NOTIFYICONDATA(ctypes.Structure):
-            _fields_ = [("cbSize", ctypes.c_ulong), ("hWnd", ctypes.c_void_p),
-                        ("uID", ctypes.c_uint), ("uFlags", ctypes.c_ulong),
-                        ("uCallbackMessage", ctypes.c_ulong), ("hIcon", ctypes.c_void_p),
-                        ("szTip", ctypes.c_wchar * 128)]
-
-        nid = NOTIFYICONDATA()
-        nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
-        nid.hWnd = self.hwnd
-        nid.uID = 1
-        nid.uFlags = 0x7
-        nid.uCallbackMessage = self.WM_SHELL
-        nid.hIcon = self.hicon
-        tip = "Cloudflare WARP 智能分流"
-        if state.get("running"):
-            tip = "Cloudflare WARP 智能分流 (操作中...)"
-        elif enabled and connected:
-            tip = "Cloudflare WARP 智能分流 (分流中)"
-        elif enabled:
-            tip = "Cloudflare WARP 智能分流 (已启用/重连中)"
-        else:
-            tip = "Cloudflare WARP 智能分流 (未启用)"
-        ctypes.memmove(ctypes.addressof(nid.szTip), ctypes.create_unicode_buffer(tip), len(tip) * 2)
-        user32.Shell_NotifyIconW(0x1, ctypes.byref(nid))  # NIM_MODIFY
+        try:
+            if state.get("running"):
+                color, tip = (245, 158, 11), "Cloudflare WARP 智能分流 (操作中...)"
+            elif enabled and connected:
+                color, tip = (34, 197, 94), "Cloudflare WARP 智能分流 (分流中)"
+            elif enabled:
+                color, tip = (245, 158, 11), "Cloudflare WARP 智能分流 (已启用/重连中)"
+            else:
+                color, tip = (239, 68, 68), "Cloudflare WARP 智能分流 (未启用)"
+            # 仅状态真正变化时才重建图标, 避免每 5 秒无谓销毁/创建
+            if tip != self._tip:
+                self._tip = tip
+                new_icon = make_hicon(color)
+                if new_icon:
+                    if self.hicon:
+                        user32.DestroyIcon(self.hicon)
+                    self.hicon = new_icon
+            nid = self._nid(self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP, self._tip)
+            ctypes.windll.shell32.Shell_NotifyIconW(self.NIM_MODIFY, ctypes.byref(nid))
+        except Exception as e:
+            log("托盘 update 异常: " + str(e), logging.DEBUG)
 
     def _open(self):
         try:
@@ -1248,15 +1338,23 @@ class TrayApp:
     def _show_menu(self):
         user32 = ctypes.windll.user32
         menu = user32.CreatePopupMenu()
-        user32.AppendMenuW(menu, 0, self.MSG_OPEN, "打开控制台")
-        user32.AppendMenuW(menu, 0, self.MSG_ENABLE, "启用分流")
-        user32.AppendMenuW(menu, 0, self.MSG_DISABLE, "停用分流")
-        user32.AppendMenuW(menu, 0, self.MSG_FIX, "修复 IPv6")
-        user32.AppendMenuW(menu, 0, self.MSG_EXIT, "退出")
+        if not menu:
+            return
+        MF_STRING, MF_SEPARATOR = 0x0, 0x800
+        user32.AppendMenuW(menu, MF_STRING, self.MSG_OPEN, "打开控制台")
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, "")
+        user32.AppendMenuW(menu, MF_STRING, self.MSG_ENABLE, "启用分流")
+        user32.AppendMenuW(menu, MF_STRING, self.MSG_DISABLE, "停用分流")
+        user32.AppendMenuW(menu, MF_STRING, self.MSG_FIX, "修复 IPv6")
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, "")
+        user32.AppendMenuW(menu, MF_STRING, self.MSG_EXIT, "退出")
         pos = ctypes.wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pos))
         user32.SetForegroundWindow(self.hwnd)
-        user32.TrackPopupMenu(menu, 0, pos.x, pos.y, 0, self.hwnd, 0)
+        # 左键对齐 + 不通知父窗口
+        user32.TrackPopupMenu(menu, 0x0000 | 0x0002, pos.x, pos.y, 0, self.hwnd, 0)
+        # 发送空消息, 修复 "菜单失去焦点后不消失" 的经典问题
+        user32.PostMessageW(self.hwnd, 0, 0, 0)
         user32.DestroyMenu(menu)
 
     def _menu(self, cmd):
@@ -1274,8 +1372,14 @@ class TrayApp:
             self.quit()
 
     def quit(self):
+        # 正确移除图标: 必须用与 NIM_ADD 一致的 hWnd/uID 结构体
         try:
-            ctypes.windll.user32.Shell_NotifyIconW(0x2, ctypes.byref(ctypes.create_string_buffer(0)))  # best-effort remove
+            user32 = ctypes.windll.user32
+            ctypes.windll.shell32.Shell_NotifyIconW(self.NIM_DELETE,
+                                                    ctypes.byref(self._nid(0)))
+            if self.hicon:
+                user32.DestroyIcon(self.hicon)
+                self.hicon = 0
         except Exception:
             pass
         EXIT_EVENT.set()
@@ -1286,16 +1390,28 @@ class TrayApp:
         os._exit(0)
 
     def run(self):
-        if not self.create():
-            log("托盘图标初始化失败 (可忽略, Web 控制台仍可用)", logging.WARNING)
-            return
-        user32 = ctypes.windll.user32
-        msg = ctypes.wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-        # 退出
-        EXIT_EVENT.set()
+        try:
+            if not self.create():
+                log("托盘图标初始化失败 (可忽略, Web 控制台仍可用)", logging.WARNING)
+                return
+            log("托盘图标已启动: 双击打开控制台, 右键查看菜单")
+            user32 = ctypes.windll.user32
+            msg = ctypes.wintypes.MSG()
+            while True:
+                r = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+                if r <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as e:
+            # 托盘任何异常都不应影响 Web 控制台
+            log("托盘线程异常: " + str(e), logging.WARNING)
+        finally:
+            try:
+                ctypes.windll.shell32.Shell_NotifyIconW(self.NIM_DELETE,
+                                                        ctypes.byref(self._nid(0)))
+            except Exception:
+                pass
 
 
 # ====================== Web 服务 ======================
