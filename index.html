@@ -452,7 +452,11 @@ function setStatus(st){
        (rc.detail||"") + (rc.steps && rc.steps.length ? "（" + rc.steps.join("；") + "）" : ""))
     : "无";
   const nn = $("netNote");
-  if(netOk){
+  if(st.guard_paused){
+    nn.className = "dnsnote show warn";
+    nn.innerHTML = "<b>⚠ 为保障网络已自动暂停分流</b>：看门狗判定联网异常后断开了 WARP，"
+      + "并且<b>不会自动重开</b> —— 是否恢复分流由你决定。确认网络正常后，用上方开关重新启用即可。";
+  } else if(netOk){
     nn.className = "dnsnote show";
     nn.innerHTML = "<b>✓ 联网正常</b>：看门狗每 20 秒探测一次；一旦连续失败会自动退让，先保网络再谈加速。";
   } else {

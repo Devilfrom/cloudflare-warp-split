@@ -218,6 +218,7 @@ state = {
     "dns_proxy": False,       # 本地智能 DNS 分流是否在接管网卡 DNS
     "net_down": False,        # 网络保障看门狗: 当前是否探测到上不了网
     "rescue": None,           # 最近一次自动/手动急救的详情(供控制台展示)
+    "guard_paused": False,    # 是否因网络保障而自动暂停了分流(需用户手动恢复)
 }
 state_lock = threading.Lock()
 op_stop = threading.Event()
@@ -2027,6 +2028,8 @@ def dns_guard_loop():
         try:
             if not settings.get("smart_dns", True):
                 continue
+            if time.time() < net_state.get("suppress_dns_until", 0):
+                continue    # 网络保障刚判定智能 DNS 有害, 冷却期内别再装回来
             if not state["enabled"] or state["running"]:
                 continue
             if settings.get("route_mode", "tun") != "tun":
@@ -2069,7 +2072,11 @@ def dns_guard_loop():
 # 退让, 直到能为止。
 NET_PROBES = ("www.baidu.com", "www.qq.com", "one.one.one.one")
 GUARD_TASK = "CloudflareWARP-Split-Guard"
-net_state = {"ok": True, "detail": "", "ts": 0.0, "streak": 0, "last_action": ""}
+net_state = {
+    "ok": True, "detail": "", "ts": 0.0, "streak": 0, "last_action": "",
+    "cooldown_until": 0.0,      # 刚救过一次, 冷却期内不再动(避免与自愈/重连打架)
+    "suppress_dns_until": 0.0,  # 判定"智能 DNS 有害"后, 冷却期内别再把它装回来
+}
 
 
 def _resolve_ok(host, timeout=2.5):
@@ -2114,6 +2121,11 @@ def rescue_network(reason=""):
         return True, "网络正常 (%s)" % detail
     log("网络不可用(%s)%s, 开始急救..." % (detail, (" 触发原因: " + reason) if reason else ""),
         logging.WARNING)
+    # 一旦进入退让就上两个冷却, 防止几个守护线程互相拆台、来回震荡:
+    #   cooldown      5 分钟内 net_guard 不再重复动网络
+    #   suppress_dns  10 分钟内 dns_guard 别把刚判定有害的智能 DNS 再装回来
+    net_state["cooldown_until"] = time.time() + 300
+    net_state["suppress_dns_until"] = time.time() + 600
     steps = []
 
     # ---- L0: 撤掉我们动过的 DNS ----
@@ -2132,6 +2144,22 @@ def rescue_network(reason=""):
     # ---- L1: 断开隧道回到直连 ----
     try:
         warp(["disconnect"], timeout=20)
+        # 关键: 断开的同时必须摘掉"允许自动重连"的旗标。否则 reconnect_loop
+        # 会在 15 秒后把隧道拉回来 —— 我们正是因为"分流状态下网络不可用"
+        # 才断开的, 拉回去等于把刚救回来的网络又拖进同一个坑, 而且用户
+        # 看起来就是"我明明关了它又自己开了"。
+        # 保障层只做减法: 它永远不会主动启用分流, 恢复与否交给用户决定。
+        with state_lock:
+            state["armed"] = False
+            was_on = state["enabled"]
+            if was_on:
+                state["enabled"] = False
+                state["route_active"] = None
+                state["guard_paused"] = True
+        if was_on:
+            save_state()
+            log("为保障网络已暂停分流 —— 不会自动重开, 请确认网络正常后手动启用",
+                logging.WARNING)
         steps.append("已断开 WARP 隧道(回到直连)")
     except Exception as e:
         steps.append("L1 失败: %s" % e)
@@ -2239,6 +2267,8 @@ def net_guard_loop():
                 continue
             if not settings.get("net_guard", True):
                 continue    # 用户关掉了自动保障
+            if time.time() < net_state.get("cooldown_until", 0):
+                continue    # 刚救过一次, 冷却期内不再动
             ok2, msg2 = rescue_network(detail)
             net_state["streak"] = 0
             log("自动保障结果: " + msg2, logging.INFO if ok2 else logging.ERROR)
@@ -2408,6 +2438,7 @@ def enable_split():
             state["resume_pending"] = False
             state["route_active"] = "tun"
             state["auto_restored"] = False   # 手动重新启用后清除自愈还原提示
+            state["guard_paused"] = False    # 用户确认网络后手动恢复, 清掉保障暂停标记
             state["progress"] = {"total": total, "done": total, "phase": "分流已启用"}
         save_state()
         log(f"分流启用完成: {total} 条规则已就位, daemon 现有排除 "
@@ -2485,6 +2516,11 @@ def disable_split():
             state["progress"] = {"total": 0, "done": 0, "phase": "已停用，网络恢复正常"}
         save_state()
         log("分流已停用，网络恢复直连 (排除规则已保留, 再次启用可秒级完成)")
+        # 停用的目的就是回到干净能上网的状态 —— 异步确认一次真的通了。
+        # 注意 ensure_net_ok 只会继续退让(还原 DNS / 断开 WARP), 绝不会把
+        # 分流再打开, 所以这里不用担心"关了又自己开"。
+        threading.Thread(target=ensure_net_ok,
+                         args=("停用分流后",), daemon=True).start()
     except Exception as e:
         log("停用失败: " + str(e), logging.ERROR)
         with state_lock:
@@ -3419,6 +3455,7 @@ def get_status():
             "net_down": state.get("net_down", False),
             "rescue": state.get("rescue"),
             "net_guard": settings.get("net_guard", True),
+            "guard_paused": state.get("guard_paused", False),
             "guard_task": watchdog_enabled() if _IS_WIN else False,
             "nic_dns": read_nic_dns() if _IS_WIN else [],
             "dns_fallback": _cached_fallback_server(),
