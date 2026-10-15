@@ -24,6 +24,7 @@ import json
 import time
 import struct
 import shutil
+import socket
 import threading
 import subprocess
 
@@ -89,6 +90,21 @@ def asset_path(name):
     if os.path.isfile(p):
         return p
     return os.path.join(RES_DIR, name)
+
+
+def port_in_use(port, host="127.0.0.1", timeout=0.6):
+    """检测端口是否已有服务在监听(即已有实例在运行)。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 def pause(msg="按回车退出..."):
@@ -1054,7 +1070,8 @@ def register_autostart():
     py = sys.executable
     script = os.path.abspath(__file__)
     # /tr 用列表传入, 避免 shell 引号问题
-    tr = '"%s" "%s" --tray' % (py, script)
+    # 开机自启时不去自动弹浏览器(只在托盘待命), 用 --no-browser 控制
+    tr = '"%s" "%s" --tray %s' % (py, script, NO_BROWSER_FLAG)
     r = _run(
         ["schtasks", "/create", "/tn", AUTOSTART_TASK, "/tr", tr,
          "/sc", "onlogon", "/rl", "highest", "/f"],
@@ -1656,6 +1673,7 @@ server = None
 # 被拒绝, 此时必须停止重试——否则会陷入「启动 -> 检测非管理员 -> 再启动」
 # 的死循环, 表现为不停弹出/闪烁控制台窗口。
 ELEVATED_FLAG = "--elevated"
+NO_BROWSER_FLAG = "--no-browser"
 
 _shell_execute = ctypes.windll.shell32.ShellExecuteW
 _shell_execute.restype = ctypes.wintypes.HINSTANCE
@@ -1703,6 +1721,20 @@ def main():
     ensure_data_files()
     load_settings()
     load_state()
+
+    url = "http://127.0.0.1:%d/" % PORT
+
+    # 单实例: 端口已被占用说明已有实例在运行。此时不再启动第二个进程,
+    # 直接打开现有控制台即可 —— 否则每次双击都会多一个进程, 多个进程
+    # 抢同一端口会让页面连不上, 或连到已卡死的旧实例上。
+    if port_in_use(PORT):
+        log(f"端口 {PORT} 已有实例在运行, 直接打开控制台")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        sys.exit(0)
+
     if not is_admin():
         if ELEVATED_FLAG in sys.argv:
             # 已经提权重启过一次, 却仍不是管理员 —— 继续重试只会导致
@@ -1742,13 +1774,26 @@ def main():
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     except OSError as e:
         log(f"无法在端口 {PORT} 启动服务: {e}（可能已有实例在运行，端口被占用）", logging.ERROR)
+        alert(f"无法在端口 {PORT} 启动服务。\n\n"
+              "可能是已有实例正在运行，请先在任务管理器结束\n"
+              "WARP-Split-Console.exe 后重试。\n\n"
+              f"错误信息: {e}")
         pause()
         sys.exit(1)
+
+    # 服务已就绪 —— 自动打开控制台。
+    # 打包后是窗口程序(无控制台), 不主动打开的话双击 exe 将毫无反馈,
+    # 看起来就像「点了没反应」。
+    if NO_BROWSER_FLAG not in sys.argv:
+        try:
+            threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+        except Exception:
+            pass
 
     # 托盘 (独立线程, 失败不影响 Web 服务)
     tray = None
     if tray_mode:
-        tray = TrayApp(f"http://127.0.0.1:{PORT}/")
+        tray = TrayApp(url)
         threading.Thread(target=tray.run, daemon=True).start()
 
     # 周期性更新托盘图标
