@@ -82,6 +82,13 @@
   .tswitch::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.2s}
   .tswitch.on{background:var(--accent)}
   .tswitch.on::after{left:23px}
+  .seg{display:flex;gap:6px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:4px}
+  .segbtn{flex:1;padding:9px 6px;border:0;border-radius:7px;background:transparent;color:var(--sub);font-size:13px;cursor:pointer;transition:.15s;font-family:inherit}
+  .segbtn:hover{color:var(--txt)}
+  .segbtn.on{background:var(--accent);color:#fff;font-weight:600}
+  .routedesc{margin-top:10px;font-size:12px;color:var(--sub);line-height:1.7}
+  .routedesc b{color:var(--txt);font-weight:600}
+  .portbox{margin-top:12px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
   .rules .list{max-height:160px;overflow-y:auto;margin-bottom:10px}
   .rule{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;margin-bottom:6px;font-size:13px}
   .rule .meta{color:var(--sub);font-size:11px}
@@ -135,6 +142,24 @@
       <div class="switch-label" id="switchLabel">点击启用</div>
       <div class="progress"><i id="progBar"></i></div>
       <div class="phase" id="phase">空闲</div>
+    </div>
+
+    <div class="card">
+      <h2>分路模式 <span style="font-size:11px;color:var(--sub)">（切换前会先停用）</span></h2>
+      <div class="seg" id="segRoute">
+        <button class="segbtn" data-mode="tun">TUN 全局</button>
+        <button class="segbtn" data-mode="proxy">Proxy 分路</button>
+      </div>
+      <div class="routedesc" id="routeDesc"></div>
+      <div class="portbox" id="proxyBox" style="display:none">
+        <div class="kv"><span class="k">分流桥 HTTP</span><span class="val" id="kvBridge">—</span></div>
+        <div class="kv"><span class="k">WARP SOCKS5</span><span class="val" id="kvSocks">—</span></div>
+        <div class="kv"><span class="k">桥接 直连 / 代理</span><span class="val" id="kvBstat">—</span></div>
+        <div class="row" style="margin-top:10px">
+          <div><div>写入系统代理</div><div class="desc">让不认 SOCKS 的普通应用也走分流；局域网与 localhost 自动绕过</div></div>
+          <div class="tswitch" id="swSysProxy"></div>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -344,6 +369,24 @@ function setStatus(st){
     } else { hl.className="healnote"; }
   }
 
+  // ---- 分路模式 ----
+  const rm = st.route_mode || "tun";
+  document.querySelectorAll("#segRoute .segbtn").forEach(b=>{
+    b.classList.toggle("on", b.dataset.mode===rm);
+  });
+  const isProxy = rm==="proxy";
+  $("proxyBox").style.display = isProxy ? "" : "none";
+  $("routeDesc").innerHTML = isProxy
+    ? "<b>不开 TUN，一行系统路由都不改。</b>只有配了代理的应用（浏览器 / git / curl）走 WARP；RDP、局域网、其他软件完全不受影响。不支持 UDP，游戏与 QUIC 请切回 TUN。"
+    : "<b>全局生效，零配置。</b>WARP 接管系统路由，国内 IP 段走直连、其余进隧道。含 UDP / QUIC / 游戏。";
+  $("kvBridge").textContent = "127.0.0.1:" + (st.bridge_port||7890) +
+    (st.bridge_up ? " · 已监听" : " · 未启动");
+  $("kvSocks").textContent = "127.0.0.1:" + (st.proxy_port||40000);
+  const bs = st.bridge_stats||{};
+  $("kvBstat").textContent = (bs.direct||0) + " / " + (bs.proxy||0) +
+    ((bs.errors?(" · 失败 "+bs.errors):""));
+  setToggle("swSysProxy", !!st.system_proxy);
+
   // 设置开关同步
   setToggle("swReconnect", st.auto_reconnect);
   setToggle("swAutoHeal", st.auto_heal);
@@ -490,6 +533,23 @@ function renderSelfTest(d){
 // ---- 设置开关 ----
 $("swReconnect").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swReconnect",on); postJSON("/api/settings",{auto_reconnect:on}); });
 $("swAutoHeal").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swAutoHeal",on); postJSON("/api/settings",{auto_heal:on}); });
+document.querySelectorAll("#segRoute .segbtn").forEach(function(b){
+  b.addEventListener("click",function(){
+    const m=this.dataset.mode;
+    if(this.classList.contains("on")) return;
+    document.querySelectorAll("#segRoute .segbtn").forEach(x=>x.classList.remove("on"));
+    this.classList.add("on");
+    toast(m==="proxy"?"正在切换到 Proxy 分路（先停用再启用）":"正在切换到 TUN 全局");
+    postJSON("/api/route",{mode:m}).then(loadStatus);
+  });
+});
+$("swSysProxy").addEventListener("click",function(){
+  const on=!this.classList.contains("on"); setToggle("swSysProxy",on);
+  postJSON("/api/system-proxy",{on:on}).then(r=>{
+    toast(on?"已把分流桥写入系统代理（局域网已绕过）":"已还原系统代理设置");
+    loadStatus();
+  });
+});
 $("swAutoResume").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swAutoResume",on); postJSON("/api/settings",{auto_resume:on}); toast(on?"程序启动时会自动恢复上次的分流状态":"程序启动后不会自己动网络"); });
 $("swAutoUpdate").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swAutoUpdate",on); postJSON("/api/settings",{auto_update:on}); });
 $("swSpeed").addEventListener("click",function(){ const on=!this.classList.contains("on"); setToggle("swSpeed",on); postJSON("/api/settings",{metrics_speed:on}); });

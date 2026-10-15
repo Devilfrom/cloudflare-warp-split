@@ -31,6 +31,7 @@ import time
 import struct
 import shutil
 import socket
+import select
 import threading
 import subprocess
 
@@ -67,7 +68,7 @@ import ctypes
 import ctypes.wintypes  # 必须显式导入: MSG/POINT 等类型在此子模块, 仅 import ctypes 不会加载
 import ipaddress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
 # ====================== 配置 ======================
@@ -208,6 +209,9 @@ state = {
     "auto_restored": False,   # 是否因自愈失败而自动还原过(供控制台提示)
     "armed": False,           # 本次会话是否已确认分流状态(冷启动保护, 见 reconnect_loop)
     "resume_pending": False,  # 上次启用了但本次未自动恢复(供控制台提示)
+    "route_active": None,     # 当前实际生效的分路: "tun" / "proxy" / None
+    "bridge_up": False,       # 本地分流桥是否在监听
+    "sysproxy_on": False,     # 是否已写入 Windows 系统代理
 }
 state_lock = threading.Lock()
 op_stop = threading.Event()
@@ -225,6 +229,12 @@ settings = {
     "metrics_speed": True,
     "tray": True,
     "active_lists": ["china_cidr.txt"],
+    # ---- Proxy 分路 (不开 TUN 的第二条路) ----
+    "route_mode": "tun",          # "tun" = 全局 TUN 分流; "proxy" = SOCKS5 分路
+    "proxy_port": 40000,          # WARP 原生 SOCKS5 上行端口
+    "bridge_port": 7890,          # 本地智能分流 HTTP 桥端口
+    "system_proxy": False,        # 是否把分流桥写进 Windows 系统代理(默认关)
+    "_sysproxy_backup": None,     # 系统代理原值备份, 用于精确还原
 }
 
 # 指标 (内存态, 不持久化)
@@ -562,7 +572,9 @@ def get_egress_ip(ttl=25):
 def save_state():
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"enabled": state["enabled"]}, f, ensure_ascii=False, indent=2)
+            json.dump({"enabled": state["enabled"],
+                       "route_active": state.get("route_active")},
+                      f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -869,8 +881,14 @@ def fix_ipv6():
 
 
 # ====================== 连接 / 重连 ======================
-def connect_warp(max_attempts=4, update_phase=True):
-    """连接 WARP, 带『断重连 + 服务重启』兜底。返回 (connected, last_out)。"""
+def connect_warp(max_attempts=4, update_phase=True, mode=None):
+    """连接 WARP, 带『断重连 + 服务重启』兜底。返回 (connected, last_out)。
+
+    mode 为 None 时按当前分路模式决定(warp / proxy)。重启服务兜底那一步
+    必须显式带上 mode —— 写死 "warp" 会在 Proxy 分路下把模式悄悄改回去。
+    """
+    if mode is None:
+        mode = "proxy" if settings.get("route_mode", "tun") == "proxy" else "warp"
     connected = False
     last_out = ""
     for attempt in range(1, max_attempts + 1):
@@ -902,7 +920,7 @@ def connect_warp(max_attempts=4, update_phase=True):
     if not connected:
         log("常规重试未连上, 尝试重启 CloudflareWARP 服务...", logging.WARNING)
         restart_warp_service()
-        warp(["mode", "warp"], timeout=20)
+        warp(["mode", mode], timeout=20)
         time.sleep(1)
         warp(["disconnect"], timeout=20)
         time.sleep(2)
@@ -921,8 +939,510 @@ def connect_warp(max_attempts=4, update_phase=True):
     return connected, last_out
 
 
+# ====================== Proxy 分路 (不开 TUN) ======================
+# net-warp 那类方案拒用 TUN 的理由是 RDP: TUN 接管系统默认路由, 隧道一抖
+# 远程桌面就断在门外。我们不必像它那样自己写一个 Go 分流桥 —— 本机
+# warp-cli (2026.6.x) 原生支持:
+#     warp-cli mode proxy          # 建隧道供 SOCKS5 使用, 不创建 TUN 适配器
+#     warp-cli proxy port <port>   # 指定 SOCKS5 监听端口 (127.0.0.1:<port>)
+# 实测(见 tools/test_proxy_mode.py): 切到 proxy 模式后 CloudflareWARP 适配器
+# 根本不存在、WARP 接口路由 0 条, 裸直连 trace 显示 warp=off —— 系统路由一行未改。
+#
+# 缺的那半是「分流」: 裸 SOCKS5 不分流, 配了代理的国内站也要绕地球一圈。
+# 所以再叠一层本地 HTTP 桥: 目标域名经 DoH 解析后用 is_cn_ip() 判定,
+# 国内直连、国外走 WARP SOCKS5。纯标准库, 无需 Go / 无需编译。
+PROXY_PORT_DEFAULT = 40000     # WARP 原生 SOCKS5 上行端口
+BRIDGE_PORT_DEFAULT = 7890     # 本地智能分流 HTTP 桥端口
+SYS_PROXY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+# 明确的国内域名后缀: 省掉一次 DoH 往返(其余域名仍走 DoH + IP 判定, 更准)
+CN_DOMAIN_SUFFIX = (
+    ".cn", ".com.cn", ".net.cn", ".org.cn", ".gov.cn", ".edu.cn",
+    ".ac.cn", ".mil.cn", ".公司", ".中国", ".网络",
+)
+
+_HOP_HEADERS = {"connection", "proxy-connection", "keep-alive",
+                "proxy-authenticate", "proxy-authorization", "te",
+                "trailer", "transfer-encoding", "upgrade"}
+
+_RESOLVE_CACHE = {}
+_RESOLVE_TTL = 300          # DoH 结果缓存 5 分钟
+_bridge_lock = threading.Lock()
+_bridge_server = None
+bridge_stats = {"direct": 0, "proxy": 0, "errors": 0, "started_at": None,
+                "last_target": "", "last_way": ""}
+
+
+def _is_ip_literal(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except Exception:
+        return False
+
+
+def _system_a(host):
+    try:
+        return sorted({i[4][0] for i in socket.getaddrinfo(host, None, socket.AF_INET)})
+    except Exception:
+        return []
+
+
+def _resolve_cached(host):
+    """解析域名, 结果缓存 5 分钟。**系统 DNS 优先, DoH 只作兜底。**
+
+    这里刻意不像 net-warp 那样强制走 DoH —— 它必须 DoH, 因为它的桥要自己
+    拿着解析出的 IP 去连国外站, 拿到被污染的 IP 就白搭。而我们:
+      - 判定为「走代理」时, 是把**域名**交给 SOCKS5 远端解析的(见
+        _upstream_for), 本地解析结果根本不参与连接, 污染与否不影响结果;
+      - 判定为「直连」时连的是国内站, 本来就没有污染问题。
+    所以本地解析只用来做「国内外」判定, 用最快的那个即可。
+
+    实测: 系统解析 0.17s; DoH 0.5s(走 WARP 时) ~ 8s(Proxy 分路下系统
+    未走 WARP 时)。首包延迟差了 40 倍, 没有理由为用不上的准确性买单。
+    """
+    now = time.time()
+    ent = _RESOLVE_CACHE.get(host)
+    if ent and now - ent[0] < _RESOLVE_TTL:
+        return ent[1]
+    ips = _system_a(host)
+    if not ips:
+        ips = doh_resolve(host, timeout=2.5)
+    _RESOLVE_CACHE[host] = (now, ips)
+    return ips
+
+
+def route_of(host):
+    """判定一个目标该走『直连』还是『WARP 代理』。返回 "direct" / "proxy"。
+
+    判定依据是 IP: 域名先用 DoH 解析(带缓存), 解析出的 IP **全部**落在国内
+    或私有段才直连, 否则走代理。之所以用「全部」而不是「任一」:
+       - 判错成 direct 的代价是被墙站点直接打不开(失败);
+       - 判错成 proxy 的代价只是国内站绕一圈(变慢, 但仍能用)。
+    宁可慢, 不可不可用。
+    """
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return "direct"
+    if host == "localhost" or host.endswith(".local") or host.endswith(".arpa"):
+        return "direct"
+    if _is_ip_literal(host):
+        return "direct" if (is_private_ip(host) or is_cn_ip(host)) else "proxy"
+    for suf in CN_DOMAIN_SUFFIX:
+        if host == suf.lstrip(".") or host.endswith(suf):
+            return "direct"
+    ips = _resolve_cached(host)
+    if ips and all(is_private_ip(i) or is_cn_ip(i) for i in ips):
+        return "direct"
+    return "proxy"
+
+
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise IOError("连接被对端关闭")
+        buf += chunk
+    return buf
+
+
+def socks5_connect(host, port, proxy_host="127.0.0.1", proxy_port=None, timeout=15):
+    """完成 SOCKS5 握手并返回已连通到 host:port 的 socket。
+
+    只用到 CONNECT(0x01) + 域名类型(0x03), 不需要认证 —— WARP 的本地
+    SOCKS5 只监听 127.0.0.1, 本身不要求鉴权。UDP associate 不实现:
+    QUIC / 游戏加速请用 TUN 路线。
+    """
+    pp = int(proxy_port or settings.get("proxy_port", PROXY_PORT_DEFAULT))
+    s = socket.create_connection((proxy_host, pp), timeout=timeout)
+    try:
+        s.sendall(b"\x05\x01\x00")                 # 版本5, 1个方法, 无认证
+        greet = _recv_exact(s, 2)
+        if greet[0] != 0x05 or greet[1] != 0x00:
+            raise IOError("SOCKS5 协商被拒: %s" % greet.hex())
+        h = host.encode("idna")
+        if len(h) > 255:
+            raise IOError("域名过长")
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + struct.pack(">H", port))
+        rep = _recv_exact(s, 4)
+        if rep[1] != 0x00:
+            raise IOError("SOCKS5 CONNECT 失败, 代码 %d" % rep[1])
+        atyp = rep[3]
+        if atyp == 0x01:
+            _recv_exact(s, 6)
+        elif atyp == 0x03:
+            _recv_exact(s, 1 + _recv_exact(s, 1)[0] + 2)
+        elif atyp == 0x04:
+            _recv_exact(s, 18)
+        return s
+    except Exception:
+        try:
+            s.close()
+        except Exception:
+            pass
+        raise
+
+
+def _pump(a, b, timeout=600):
+    """在两个 socket 之间双向搬运字节, 任一端断开即结束。"""
+    socks = [a, b]
+    try:
+        while True:
+            r, _, e = select.select(socks, [], socks, timeout)
+            if e or not r:
+                return
+            for s in r:
+                try:
+                    data = s.recv(65536)
+                except Exception:
+                    return
+                if not data:
+                    return
+                try:
+                    (b if s is a else a).sendall(data)
+                except Exception:
+                    return
+    finally:
+        for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+
+
+def _upstream_for(host, port):
+    """按分流判定建立上游连接: 国内/私有直连, 国外走 WARP SOCKS5。"""
+    way = route_of(host)
+    try:
+        if way == "proxy":
+            # 走代理时把域名交给远端解析(SOCKS5 的 ATYP=0x03), 既避免本地
+            # DNS 污染, 也让 DoH 拿不到的域名仍有机会解析成功。
+            up = socks5_connect(host, port)
+        else:
+            # 直连时直接用刚才判定用的那份 IP, 不再走一次 getaddrinfo。
+            # 这一点很关键: 系统解析可能优先返回 AAAA, 而很多国内站的 IPv6
+            # 根本不通, 于是每次请求都要等 IPv6 超时再退回 IPv4 —— 实测
+            # 国内站经桥访问会因此慢到 4 秒级, 而裸直连只要 0.2 秒。
+            cands = ([host] if _is_ip_literal(host)
+                     else (_resolve_cached(host) or [host]))
+            up = None
+            last = None
+            for ip in cands[:3]:
+                try:
+                    up = socket.create_connection((ip, port), timeout=8)
+                    break
+                except Exception as e:
+                    last = e
+            if up is None:
+                raise last or IOError("无可用的直连地址")
+    except Exception as e:
+        bridge_stats["errors"] += 1
+        raise IOError("%s 连接失败(%s): %s" % (host, way, e))
+    bridge_stats[way] = bridge_stats.get(way, 0) + 1
+    bridge_stats["last_target"] = host
+    bridge_stats["last_way"] = way
+    return up, way
+
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    """本地智能分流 HTTP 代理。同时支持 CONNECT(HTTPS 隧道) 与明文 HTTP 转发。"""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "WARP-Split-Bridge"
+    sys_version = ""
+
+    def log_message(self, *a):
+        pass
+
+    # ---------- HTTPS: CONNECT 隧道 ----------
+    def do_CONNECT(self):
+        host, _, pstr = self.path.rpartition(":")
+        try:
+            port = int(pstr or 443)
+        except Exception:
+            port = 443
+        try:
+            up, _way = _upstream_for(host, port)
+        except Exception as e:
+            bridge_stats["errors"] += 1
+            self.send_error(502, str(e)[:120])
+            return
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        _pump(self.connection, up)
+
+    # ---------- 明文 HTTP 转发 ----------
+    def _relay(self):
+        parts = urlsplit(self.path)
+        host = parts.hostname or ""
+        try:
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+        except Exception:
+            port = 80
+        if not host:
+            self.send_error(400, "缺少目标主机")
+            return
+        try:
+            up, _way = _upstream_for(host, port)
+        except Exception as e:
+            bridge_stats["errors"] += 1
+            self.send_error(502, str(e)[:120])
+            return
+        target = parts.path or "/"
+        if parts.query:
+            target += "?" + parts.query
+        lines = ["%s %s HTTP/1.1" % (self.command, target),
+                 "Host: %s" % parts.netloc]
+        for k, v in self.headers.items():
+            if k.lower() in _HOP_HEADERS or k.lower() == "host":
+                continue
+            lines.append("%s: %s" % (k, v))
+        try:
+            up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace"))
+            clen = self.headers.get("Content-Length")
+            if clen:
+                try:
+                    up.sendall(self.rfile.read(int(clen)))
+                except Exception:
+                    pass
+        except Exception as e:
+            bridge_stats["errors"] += 1
+            try:
+                up.close()
+            except Exception:
+                pass
+            self.send_error(502, str(e)[:120])
+            return
+        self.close_connection = True
+        _pump(self.connection, up)
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = _relay
+    do_OPTIONS = do_PATCH = do_TRACE = _relay
+
+
+def bridge_port():
+    return int(settings.get("bridge_port", BRIDGE_PORT_DEFAULT))
+
+
+def start_bridge():
+    """启动本地分流桥。已启动则先停再起(端口变了也能生效)。"""
+    global _bridge_server
+    stop_bridge()
+    port = bridge_port()
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), BridgeHandler)
+    except Exception as e:
+        log("分流桥启动失败 (端口 %d): %s" % (port, e), logging.ERROR)
+        return False, "分流桥端口 %d 启动失败: %s" % (port, e)
+    srv.daemon_threads = True
+    _bridge_server = srv
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    bridge_stats["started_at"] = time.time()
+    with state_lock:
+        state["bridge_up"] = True
+    log("本地分流桥已启动: 127.0.0.1:%d (国内直连 / 国外走 WARP SOCKS5 %d)"
+        % (port, settings.get("proxy_port", PROXY_PORT_DEFAULT)))
+    return True, "分流桥已监听 127.0.0.1:%d" % port
+
+
+def stop_bridge():
+    global _bridge_server
+    if _bridge_server is None:
+        with state_lock:
+            state["bridge_up"] = False
+        return
+    try:
+        _bridge_server.shutdown()
+    except Exception:
+        pass
+    try:
+        _bridge_server.server_close()
+    except Exception:
+        pass
+    _bridge_server = None
+    with state_lock:
+        state["bridge_up"] = False
+    log("本地分流桥已停止")
+
+
+# ---------------------- Windows 系统代理 (可选开关) ----------------------
+def get_system_proxy():
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, SYS_PROXY_KEY, 0, winreg.KEY_READ)
+        try:
+            enable = winreg.QueryValueEx(k, "ProxyEnable")[0]
+            server = winreg.QueryValueEx(k, "ProxyServer")[0]
+        finally:
+            winreg.CloseKey(k)
+        return bool(enable), str(server or "")
+    except Exception:
+        return False, ""
+
+
+def set_system_proxy(on, port=None):
+    """写/还原 HKCU 的 Internet Settings。首次写入前备份原值以便精确还原。
+
+    ProxyOverride 里保留局域网段: 即便开了系统代理, 访问 192.168.x / 10.x
+    也不该绕代理 —— 这是 Proxy 分路"局域网零影响"承诺的一部分。
+    """
+    import winreg
+    port = int(port or bridge_port())
+    bypass = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;" \
+             "172.2*;172.30.*;172.31.*;192.168.*;::1;169.254.*"
+    try:
+        if on:
+            if not settings.get("_sysproxy_backup"):
+                en, sv = get_system_proxy()
+                settings["_sysproxy_backup"] = {"enable": en, "server": sv}
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, SYS_PROXY_KEY,
+                               0, winreg.KEY_WRITE)
+            try:
+                winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+                winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ,
+                                  "127.0.0.1:%d" % port)
+                winreg.SetValueEx(k, "ProxyOverride", 0, winreg.REG_SZ, bypass)
+            finally:
+                winreg.CloseKey(k)
+        else:
+            bak = settings.get("_sysproxy_backup") or {"enable": False, "server": ""}
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, SYS_PROXY_KEY,
+                               0, winreg.KEY_WRITE)
+            try:
+                winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD,
+                                  1 if bak.get("enable") else 0)
+                winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ,
+                                  bak.get("server", ""))
+            finally:
+                winreg.CloseKey(k)
+            settings["_sysproxy_backup"] = None
+        try:    # 通知系统刷新代理设置, 否则部分进程要等很久才生效
+            ctypes.windll.wininet.InternetSetOptionW(0, 39, None, 0)  # SETTINGS_CHANGED
+            ctypes.windll.wininet.InternetSetOptionW(0, 37, None, 0)  # REFRESH
+        except Exception:
+            pass
+        with state_lock:
+            state["sysproxy_on"] = bool(on)
+        log("系统代理已" + ("设置为 127.0.0.1:%d (局域网已绕过)" % port if on else "还原"))
+        return True
+    except Exception as e:
+        log("设置系统代理失败: " + str(e), logging.ERROR)
+        return False
+
+
+def enable_proxy_route():
+    """启用 Proxy 分路: 不创建 TUN、不改系统路由, 只给『配了代理的应用』加速。"""
+    with state_lock:
+        if state["running"]:
+            return
+        state["running"] = True
+        state["action"] = "enable"
+        state["progress"] = {"total": 0, "done": 0, "phase": "正在切换到 Proxy 分路..."}
+    log("开始启用 Proxy 分路 (mode proxy, 不开 TUN, 不改系统路由)...")
+    try:
+        pp = int(settings.get("proxy_port", PROXY_PORT_DEFAULT))
+        warp(["disconnect"], timeout=20)
+        time.sleep(1)
+        ok, out = warp(["proxy", "port", str(pp)], timeout=20)
+        if not ok:
+            log("设置 SOCKS5 端口失败: " + out[:120], logging.WARNING)
+        else:
+            log("WARP SOCKS5 端口已设为 %d" % pp)
+        ok, out = warp(["mode", "proxy"], timeout=20)
+        if not ok:
+            log("设置 mode proxy 返回: " + out[:120], logging.WARNING)
+
+        connected, last_out = connect_warp(update_phase=True, mode="proxy")
+        if not connected:
+            raise RuntimeError("WARP proxy 模式未能连接。最后状态: " + last_out[:160])
+
+        # 等 SOCKS5 端口起来(daemon 建隧道后才监听)
+        up = False
+        for _ in range(30):
+            s = socket.socket()
+            s.settimeout(1)
+            try:
+                s.connect(("127.0.0.1", pp))
+                up = True
+            except Exception:
+                time.sleep(0.5)
+            finally:
+                s.close()
+            if up:
+                break
+        if not up:
+            raise RuntimeError("WARP 已连接但 127.0.0.1:%d 未监听, SOCKS5 不可用" % pp)
+        log("WARP proxy 模式已连接, SOCKS5 127.0.0.1:%d 可用" % pp)
+
+        ok, msg = start_bridge()
+        if not ok:
+            raise RuntimeError(msg)
+        if settings.get("system_proxy"):
+            set_system_proxy(True)
+
+        with state_lock:
+            state["enabled"] = True
+            state["route_active"] = "proxy"
+            state["armed"] = True
+            state["auto_restored"] = False
+            state["progress"] = {"total": 0, "done": 0, "phase": "Proxy 分路已启用"}
+        save_state()
+        log("Proxy 分路启用完成: 系统路由未改动, 分流桥 127.0.0.1:%d"
+            % bridge_port())
+    except Exception as e:
+        log("启用 Proxy 分路失败: " + str(e), logging.ERROR)
+        with state_lock:
+            state["error"] = str(e)
+        stop_bridge()
+        try:
+            warp(["disconnect"], timeout=20)
+        except Exception:
+            pass
+        with state_lock:
+            state["enabled"] = False
+            state["route_active"] = None
+    finally:
+        with state_lock:
+            state["running"] = False
+            state["action"] = None
+
+
+def disable_proxy_route():
+    """停用 Proxy 分路: 还原系统代理 -> 停桥 -> 断开 WARP。"""
+    with state_lock:
+        if state["running"]:
+            return
+        state["running"] = True
+        state["action"] = "disable"
+        state["progress"] = {"total": 0, "done": 0, "phase": "正在关闭 Proxy 分路..."}
+    log("开始停用 Proxy 分路...")
+    try:
+        if state.get("sysproxy_on"):
+            set_system_proxy(False)
+        stop_bridge()
+        warp(["disconnect"], timeout=20)
+        with state_lock:
+            state["enabled"] = False
+            state["armed"] = False
+            state["route_active"] = None
+            state["bridge_up"] = False
+            state["progress"] = {"total": 0, "done": 0, "phase": "已停用，网络恢复正常"}
+        save_state()
+        log("Proxy 分路已停用，网络恢复默认")
+    finally:
+        with state_lock:
+            state["running"] = False
+            state["action"] = None
+
+
 # ====================== 核心操作 ======================
 def enable_split():
+    """按当前分路模式启用。route_mode=proxy 时走 Proxy 分路(不开 TUN)。"""
+    if settings.get("route_mode", "tun") == "proxy":
+        return enable_proxy_route()
     with state_lock:
         if state["running"]:
             return
@@ -981,6 +1501,7 @@ def enable_split():
             state["enabled"] = True
             state["armed"] = True            # 本次会话已确认, 允许后续自动重连
             state["resume_pending"] = False
+            state["route_active"] = "tun"
             state["auto_restored"] = False   # 手动重新启用后清除自愈还原提示
             state["progress"] = {"total": total, "done": total, "phase": "分流已启用"}
         save_state()
@@ -1007,12 +1528,17 @@ def enable_split():
 def disable_split():
     """停用分流: 断开隧道, 网络恢复纯直连。
 
+    当前是 Proxy 分路时交给 disable_proxy_route() —— 它还得多做两件事:
+    停掉本地分流桥、还原可能写过Windows 系统代理。
+
     刻意不再做 `tunnel ip reset`:
       - 排除规则只在隧道建立时才起作用, 断开后它们完全不影响直连网络;
       - 保留规则后「再次启用」可以秒级完成, 而不是重新注入 8 分钟;
       - 这正是「每次重启都要重新注入、启动特别慢」的根因之一。
     想彻底清空规则请用「一键还原」(它会 reset)。
     """
+    if state.get("route_active") == "proxy" or state.get("bridge_up"):
+        return disable_proxy_route()
     with state_lock:
         if state["running"]:
             return
@@ -1025,6 +1551,7 @@ def disable_split():
         with state_lock:
             state["enabled"] = False
             state["armed"] = False
+            state["route_active"] = None
             state["progress"] = {"total": 0, "done": 0, "phase": "已停用，网络恢复正常"}
         save_state()
         log("分流已停用，网络恢复直连 (排除规则已保留, 再次启用可秒级完成)")
@@ -1038,8 +1565,32 @@ def disable_split():
             state["action"] = None
 
 
+def switch_route(new_mode):
+    """在 TUN 全局 / Proxy 分路之间切换。
+
+    已启用时先按旧模式完整停用(Proxy 要停桥+撤系统代理), 再按新模式启用,
+    避免留下「模式是 proxy 但 TUN 规则还在」这类半吊子状态。
+    """
+    new_mode = "proxy" if new_mode == "proxy" else "tun"
+    old = settings.get("route_mode", "tun")
+    if new_mode == old:
+        return
+    log("切换分路: %s -> %s" % (old, new_mode))
+    settings["route_mode"] = new_mode
+    save_settings()
+    with state_lock:
+        was_on = state["enabled"] and state.get("armed")
+    if was_on:
+        disable_split()
+        enable_split()
+
+
 def restore():
-    """一键还原 (紧急): 终止正在进行的操作, 强制断开, 清空自定义排除, 回到干净状态。"""
+    """一键还原 (紧急): 终止正在进行的操作, 强制断开, 清空自定义排除, 回到干净状态。
+
+    Proxy 分路下额外还原两件事: 停掉本地分流桥、撤掉写过的 Windows 系统代理,
+    并把 warp-cli 的模式切回 warp —— 否则下次启用 TUN 路线时模式还停在 proxy。
+    """
     log("执行一键还原...")
     op_stop.set()
     for _ in range(100):
@@ -1048,8 +1599,15 @@ def restore():
                 break
         time.sleep(0.2)
     op_stop.clear()
+    if state.get("sysproxy_on"):
+        try:
+            set_system_proxy(False)
+        except Exception:
+            pass
+    stop_bridge()
     try:
         warp(["disconnect"], timeout=20)
+        warp(["mode", "warp"], timeout=20)
     except Exception:
         pass
     # 优先用配置直写把 CLI 排除清空 —— 秒级完成, 且保留 daemon 自带的默认
@@ -1389,6 +1947,11 @@ def reconnect_loop():
             with state_lock:
                 state["reconnecting"] = False
             if connected:
+                # Proxy 分路没有 TUN, excluded_ips 对它毫无意义 —— 别白跑。
+                if state.get("route_active") == "proxy" or \
+                        settings.get("route_mode", "tun") == "proxy":
+                    log("WARP 已自动重连 (Proxy 分路无需同步排除规则)")
+                    continue
                 # 只补差集。旧代码在这里对 5440 条做串行 add-range, 一旦触发
                 # 就是十几分钟, 而且是在隧道已经连上的状态下做 —— 用户直接断网。
                 try:
@@ -1427,6 +1990,13 @@ def reconcile_state_on_startup():
         if connected:
             with state_lock:
                 state["armed"] = True
+                state["route_active"] = settings.get("route_mode", "tun")
+            # Proxy 分路: 进程重启后分流桥没了, 必须重新拉起来, 否则
+            # "已启用" 但 7890 没人监听, 配了代理的应用全部超时。
+            if state["route_active"] == "proxy" and not state["bridge_up"]:
+                ok2, msg = start_bridge()
+                log("Proxy 分路: 重启后自动恢复分流桥 -> " + msg,
+                    logging.INFO if ok2 else logging.ERROR)
             log(f"已确认上次的分流仍在生效 (WARP 已连接, daemon 排除规则 {n} 条)")
             return
         if settings.get("auto_resume", False):
@@ -1491,6 +2061,14 @@ def self_heal_loop():
         EXIT_EVENT.wait(3)
         try:
             if not settings.get("auto_heal", True):
+                continue
+            # Proxy 分路下系统流量本就全部直连, "国际流量没走隧道" 是设计如此
+            # 而非故障 —— 自愈判定会把它误判成失效并触发还原。这条路由
+            # reconnect_loop 保活就够, 不参与自愈。
+            if state.get("route_active") == "proxy":
+                with heal_lock:
+                    heal["fail_streak"] = 0
+                    heal["attempts"] = 0
                 continue
             if not state["enabled"] or state["running"] or state["reconnecting"]:
                 with heal_lock:
@@ -1797,6 +2375,14 @@ def get_status():
             "tray": settings.get("tray", True),
             "theme": settings.get("theme", "dark"),
             "active_lists": list(settings.get("active_lists", ["china_cidr.txt"])),
+            "route_mode": settings.get("route_mode", "tun"),
+            "route_active": state.get("route_active"),
+            "bridge_up": state.get("bridge_up", False),
+            "bridge_port": int(settings.get("bridge_port", 7890)),
+            "proxy_port": int(settings.get("proxy_port", 40000)),
+            "system_proxy": settings.get("system_proxy", False),
+            "sysproxy_on": state.get("sysproxy_on", False),
+            "bridge_stats": dict(bridge_stats),
             "latency_cn": metrics["latency_cn"],
             "latency_intl": metrics["latency_intl"],
             "dl_speed_mbps": metrics["dl_speed_mbps"],
@@ -2273,11 +2859,28 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, "msg": out})
         elif p == "/api/settings":
             for k in ("theme", "auto_reconnect", "auto_heal", "auto_update",
-                      "auto_resume", "metrics_speed", "tray"):
+                      "auto_resume", "metrics_speed", "tray",
+                      "proxy_port", "bridge_port", "system_proxy"):
                 if k in payload:
                     settings[k] = payload[k]
             save_settings()
+            # 端口变了要重启分流桥才生效
+            if state.get("bridge_up") and ("bridge_port" in payload or "proxy_port" in payload):
+                threading.Thread(target=start_bridge, daemon=True).start()
             self._json({"ok": True, "settings": settings})
+        elif p == "/api/route":
+            mode = payload.get("mode", "tun")
+            threading.Thread(target=switch_route, args=(mode,), daemon=True).start()
+            self._json({"ok": True, "msg": "正在切换到 " + mode})
+        elif p == "/api/system-proxy":
+            on = bool(payload.get("on", False))
+            settings["system_proxy"] = on
+            save_settings()
+            if state.get("route_active") == "proxy" or state.get("bridge_up"):
+                ok = set_system_proxy(on)
+            else:
+                ok = True   # 分路没起, 只记偏好; 下次启用 proxy 时自动带上
+            self._json({"ok": ok, "on": on})
         elif p == "/api/autostart/enable":
             ok, out = register_autostart()
             self._json({"ok": ok, "msg": out})
