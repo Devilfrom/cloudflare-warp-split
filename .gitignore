@@ -21,3 +21,6 @@ dist/
 *.apk
 *.apkm
 *.msi
+
+# 发布用临时文件
+.release-notes.md
