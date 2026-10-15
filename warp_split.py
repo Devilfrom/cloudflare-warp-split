@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
+r"""
 Cloudflare WARP 智能分流控制台 —— 后端
 =========================================
 功能:
@@ -12,8 +12,14 @@ Cloudflare WARP 智能分流控制台 —— 后端
 
 技术要点:
   - 仅依赖 Python 标准库 (托盘用 ctypes, 无需第三方包)
-  - 启用: disconnect -> mode warp -> connect -> 并发注入中国 IP 到 WARP 排除列表
-  - 停用/还原: disconnect + tunnel ip reset (瞬间清空自定义排除)
+  - 启用: disconnect -> mode warp -> 写入中国 IP 到 WARP 排除列表 -> connect
+          (注入在断开状态下完成, 用户全程无感; 规则齐了才连, 不会"一注入就断网")
+  - 注入: 优先"配置直写" —— 停 CloudflareWARP 服务 -> 原子改写
+          C:\ProgramData\Cloudflare\settings.json 的 excluded_ips -> 起服务。
+          实测 5400+ 条 0.007 秒写入并生效(逐条 warp-cli 要 400 秒以上)。
+          直写不可用时自动回退逐条 add-range, 功能不受影响。
+  - 停用: 仅 disconnect, 保留排除规则 -> 再次启用可秒级完成
+  - 还原: 清空 CLI 排除 + 断开 (紧急回到干净状态)
   - 状态持久化到 state.json / settings.json, 异常自动回滚
 """
 
@@ -55,6 +61,7 @@ def _run(cmd, **kw):
         kw.setdefault("creationflags", _NO_WINDOW_FLAGS)
     return subprocess.run(cmd, **kw)
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import webbrowser
 import ctypes
 import ctypes.wintypes  # 必须显式导入: MSG/POINT 等类型在此子模块, 仅 import ctypes 不会加载
@@ -136,7 +143,7 @@ def ensure_data_files():
     """打包模式下，把内置资源首次复制到 exe 同级目录，保证可持久化。"""
     if not IS_FROZEN:
         return
-    for name in ("index.html", "china_cidr.txt"):
+    for name in ("index.html", "china_cidr.txt", "china_cidr_lite.txt"):
         dst = os.path.join(APP_DIR, name)
         src = os.path.join(RES_DIR, name)
         if not os.path.isfile(dst) and os.path.isfile(src):
@@ -169,6 +176,26 @@ EGRESS_SERVICES = [
 SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes=25000000"
 AUTOSTART_TASK = "CloudflareWARP-Split"
 
+# 日志保留天数(按天轮转, 超出自动删除)
+LOG_KEEP_DAYS = int(os.environ.get("WARP_SPLIT_LOG_DAYS", "30"))
+
+# ====================== 必须直连的保留网段 ======================
+# APNIC 只分发公网地址段, 因此 china_cidr.txt 里不会包含任何 RFC1918
+# 私有地址。若不在注入时显式补上, 局域网设备(NAS / 路由器后台 / 投屏 /
+# 打印机 / 远程桌面)理论上可能被 WARP 的 TUN 接口接管而失联。
+# 实测 WARP 客户端自身会保留 LAN, 但换版本或叠加 Zero Trust 策略后
+# 该行为不受我们控制 —— 显式排除更稳妥。
+ALWAYS_DIRECT = [
+    "10.0.0.0/8",        # 私有 A 类
+    "172.16.0.0/12",     # 私有 B 类
+    "192.168.0.0/16",    # 私有 C 类
+    "127.0.0.0/8",       # 回环
+    "169.254.0.0/16",    # 链路本地(APIPA)
+    "100.64.0.0/10",     # 运营商级 NAT (CGNAT)
+    "224.0.0.0/4",       # 组播
+]
+_ALWAYS_DIRECT_SET = set(ALWAYS_DIRECT)
+
 # ====================== 全局状态 ======================
 state = {
     "enabled": False,
@@ -178,6 +205,9 @@ state = {
     "error": None,
     "reconnecting": False,
     "zerotrust_locked": False,
+    "auto_restored": False,   # 是否因自愈失败而自动还原过(供控制台提示)
+    "armed": False,           # 本次会话是否已确认分流状态(冷启动保护, 见 reconnect_loop)
+    "resume_pending": False,  # 上次启用了但本次未自动恢复(供控制台提示)
 }
 state_lock = threading.Lock()
 op_stop = threading.Event()
@@ -189,7 +219,9 @@ log_lock = threading.Lock()
 settings = {
     "theme": "dark",
     "auto_reconnect": True,
+    "auto_heal": True,
     "auto_update": False,
+    "auto_resume": False,     # 启动时自动恢复上次的分流状态(默认关, 避免"它自己又跑了")
     "metrics_speed": True,
     "tray": True,
     "active_lists": ["china_cidr.txt"],
@@ -210,12 +242,33 @@ metrics_history = []  # 近 60 个采样点 {t,cn,intl,spd}
 metrics_lock = threading.Lock()
 
 # ====================== 日志 ======================
+# 按天轮转 + 自动清理: 守护线程长年运行会持续写日志, 单文件会无限增长,
+# 既占磁盘也让排查困难。这里按 UTC 午夜切分, 超过 LOG_KEEP_DAYS 天的
+# 历史文件自动删除。
+def prune_logs(keep_days=LOG_KEEP_DAYS):
+    """删除过期的轮转日志文件(以及残留的 0 字节文件)。"""
+    try:
+        import glob
+        cutoff = time.time() - keep_days * 86400
+        for p in glob.glob(LOG_FILE + ".*"):
+            try:
+                if os.path.getsize(p) == 0 or os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 logger = logging.getLogger("warp_split")
 logger.setLevel(logging.INFO)
 _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
-_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_fh = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1,
+                               backupCount=LOG_KEEP_DAYS, encoding="utf-8")
+_fh.suffix = "%Y-%m-%d"
 _fh.setFormatter(_fmt)
 logger.addHandler(_fh)
+prune_logs()
 
 
 def log(msg, level=logging.INFO):
@@ -268,6 +321,166 @@ def restart_warp_service():
         return False
 
 
+# ====================== WARP 配置直写: 秒级注入 ======================
+# 【为什么需要】
+# `warp-cli tunnel ip add-range` 的每条请求都由 daemon 串行处理, 实测
+# 74ms/条 —— 5440 条约 400 秒, 5433 条实测耗时 8 分 36 秒。更糟的是旧的
+# 流程是「先连上 WARP 再逐条注入」, 这 8 分钟里隧道已经建立但排除规则
+# 几乎是空的, 于是所有流量(含国内流量)被灌进隧道, 表现为「注入时网络
+# 全断」。
+#
+# 【解决办法】
+# WARP 把排除列表以明文 JSON 存在
+#     C:\ProgramData\Cloudflare\settings.json  ->  excluded_ips
+# 里。只要在「服务停止」状态下原子改写该文件, 再启动服务, daemon 就会
+# 按新配置加载。实测写入 5463 条耗时 0.007 秒, 启动服务后 daemon 立即
+# 报告全部规则已生效。
+#
+# 配合「先注入后连接」的顺序 (注入期间 WARP 处于断开状态, 网络是纯直连),
+# 用户在整个启用过程中完全感知不到网络中断, 启用从 8 分钟降到数秒。
+#
+# 【安全边界】
+#   - 只替换标签为 "CLI exclude" 的条目, daemon 自带的默认排除
+#     (标签为 null 的 22 条: Apple 服务 / 组播 / 链路本地 / 保留地址)
+#     原样保留, 不碰其它任何字段。
+#   - 改写前自动备份到 warp_settings.backup.json, 写入失败会回滚。
+#   - 任何一步失败都返回 False, 调用方自动回退到逐条 CLI 注入, 绝不影响
+#     功能正确性, 只是慢一点。
+WARP_CONF = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                         "Cloudflare", "settings.json")
+WARP_SVC = "CloudflareWARP"
+CLI_EXCLUDE_LABEL = "CLI exclude"
+# 需要新增的规则超过这个数量才走"停服务直写"(服务重启本身有约 8 秒开销),
+# 少量增量走 CLI 更快。
+FAST_WRITE_MIN = int(os.environ.get("WARP_SPLIT_FAST_MIN", "120"))
+_fast_write_lock = threading.Lock()
+
+
+def _cmd(args, timeout=30):
+    """运行系统命令, 返回 (ok, 输出)。"""
+    try:
+        r = _run(args, capture_output=True, text=True, timeout=timeout, errors="ignore")
+        return r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        return False, str(e)
+
+
+def warp_conf_path():
+    return os.environ.get("WARP_SPLIT_CONF") or WARP_CONF
+
+
+def read_warp_conf():
+    """读取 WARP 配置。返回 (dict, err)。"""
+    p = warp_conf_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f), None
+    except Exception as e:
+        return None, f"读取 {p} 失败: {e}"
+
+
+def read_conf_excludes():
+    """返回 (内置默认条目列表, CLI 排除CIDR列表)。解析失败返回 (None, None)。"""
+    d, err = read_warp_conf()
+    if d is None or not isinstance(d.get("excluded_ips"), list):
+        return None, None
+    builtin, cli = [], []
+    for e in d["excluded_ips"]:
+        if not isinstance(e, (list, tuple)) or len(e) < 1:
+            continue
+        if len(e) > 1 and e[1] == CLI_EXCLUDE_LABEL:
+            cli.append(e[0])
+        else:
+            builtin.append(list(e))
+    return builtin, cli
+
+
+def svc_ctl(action, timeout=90):
+    """启停 CloudflareWARP 服务。先试 net, 再退回 sc。"""
+    verb = "stop" if action in ("stop", "down") else "start"
+    ok, out = _cmd(["net", verb, WARP_SVC], timeout=timeout)
+    if not ok:
+        ok2, out2 = _cmd(["sc", verb, WARP_SVC], timeout=timeout)
+        if ok2:
+            return True, out2
+        return False, (out or out2)
+    return True, out
+
+
+def wait_daemon_ready(timeout=40):
+    """等待 daemon 初始化完成 (服务起来后 warp-cli 需要几秒才能应答)。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        ok, out = warp(["status"], timeout=8)
+        if ok and any(k in out for k in ("Connected", "Disconnected", "Connecting",
+                                         "Reconnecting", "Disconnecting")):
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def write_excludes_fast(desired, phase_cb=None):
+    """秒级全量写入排除列表: 停服务 -> 原子改写 settings.json -> 起服务。
+
+    成功返回 (True, 说明文字); 失败返回 (False, 原因) 由调用方回退到逐条注入。
+    """
+    if not _IS_WIN:
+        return False, "非 Windows 环境"
+    with _fast_write_lock:
+        cfg = warp_conf_path()
+        if not os.path.exists(cfg):
+            return False, f"未找到 WARP 配置文件: {cfg}"
+
+        wanted = list(dict.fromkeys(desired))
+        if phase_cb:
+            phase_cb(f"准备写入 {len(wanted)} 条规则...")
+
+        # 1) 先断开, 避免 daemon 在改写瞬间还带着旧规则跑
+        warp(["disconnect"], timeout=20)
+
+        # 2) 备份 (每次覆盖上次的备份, 只保留一份最近可回滚点)
+        bak = os.path.join(APP_DIR, "warp_settings.backup.json")
+        try:
+            shutil.copy2(cfg, bak)
+        except Exception as e:
+            log(f"备份 WARP 配置失败(继续): {e}", logging.WARNING)
+
+        # 3) 停服务 —— 必须停, 否则 daemon 会用内存态把我们的写入覆盖回去
+        #    (实测: 运行中改写文件, daemon 完全无视)
+        ok, out = svc_ctl("stop")
+        if not ok:
+            return False, "停止 CloudflareWARP 服务失败: " + (out or "")[:140]
+        time.sleep(2)
+
+        # 4) 原子改写: 保留 daemon 自己写的其它字段, 只换 excluded_ips
+        try:
+            d, err = read_warp_conf()
+            if d is None:
+                d = {}
+            builtin, _old = read_conf_excludes()
+            if builtin is None:
+                builtin = []
+            d["excluded_ips"] = builtin + [[c, CLI_EXCLUDE_LABEL] for c in wanted]
+            tmp = cfg + ".warp_split_tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, cfg)
+        except Exception as e:
+            svc_ctl("start")          # 无论如何都要把服务拉起来, 不能把用户晾在断网状态
+            return False, f"写入 WARP 配置失败: {e}"
+
+        # 5) 起服务并等就绪
+        ok, out = svc_ctl("start")
+        if not ok:
+            return False, "启动 CloudflareWARP 服务失败: " + (out or "")[:140]
+        if not wait_daemon_ready():
+            return False, "CloudflareWARP 服务启动后无响应"
+
+        log(f"已通过配置直写一次性写入 {len(wanted)} 条排除规则 "
+            f"(保留内置默认 {len(builtin)} 条)")
+        return True, f"已一次性写入 {len(wanted)} 条规则"
+
+
 def read_list_file(path):
     out = []
     try:
@@ -291,8 +504,12 @@ def read_china_list():
 
 
 def read_active_ranges():
-    """读取所有"激活"的规则列表 (默认 china_cidr.txt + 自定义导入列表)。"""
-    ranges = []
+    """读取所有"激活"的规则列表 (默认 china_cidr.txt + 自定义导入列表)。
+
+    返回的最前面总是 ALWAYS_DIRECT(私有网段等必须直连的保留地址),
+    因此本函数的返回值 = 期望被 daemon 排除的完整网段集合。
+    """
+    ranges = list(ALWAYS_DIRECT)
     for name in settings.get("active_lists", ["china_cidr.txt"]):
         if not name:
             continue
@@ -309,12 +526,21 @@ def read_active_ranges():
     return uniq
 
 
-def get_egress_ip():
+_egress_cache = {"ts": 0.0, "ip": ""}
+
+
+def get_egress_ip(ttl=25):
+    """获取当前出口 IP。带 TTL 缓存 —— 前端轮询 /api/status 会频繁调用它,
+    每次都发三个 HTTPS 请求(最坏 9 秒)会显著拖慢响应。"""
+    now = time.time()
+    if _egress_cache["ip"] and (now - _egress_cache["ts"]) < ttl:
+        return _egress_cache["ip"]
     import urllib.request
     import ssl
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    res = "获取失败"
     for url in EGRESS_SERVICES:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -323,10 +549,14 @@ def get_egress_ip():
                 import re
                 m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", data)
                 if m:
-                    return m.group(1)
+                    res = m.group(1)
+                    break
         except Exception:
             continue
-    return "获取失败"
+    if res != "获取失败":
+        _egress_cache["ts"] = now
+        _egress_cache["ip"] = res
+    return res
 
 
 def save_state():
@@ -358,7 +588,12 @@ def save_settings():
 
 
 def load_state():
-    """从 state.json 恢复 enabled 标志 (进程重启后仍能正确反映实时分流状态)。"""
+    """从 state.json 恢复 enabled 标志。
+
+    注意: 这里恢复的只是「上次会话的状态」, 不等于当前事实。是否允许自动
+    重连/自动注入由 reconcile_state_on_startup() 在 daemon 就绪后判定,
+    期间 state["armed"] 保持 False (见 reconnect_loop)。
+    """
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -366,6 +601,8 @@ def load_state():
                 state["enabled"] = bool(d.get("enabled", False))
     except Exception:
         pass
+    state["armed"] = False
+    state["resume_pending"] = False
 
 
 def tcp_rtt(host, port=443, timeout=1.0):
@@ -402,6 +639,14 @@ def is_cloudflare_ip(ip):
     return any(a in n for n in CLOUDFLARE_NETS)
 
 
+def is_private_ip(ip):
+    """是否私有/保留地址(判断目的走的是本地网关直连还是隧道)。"""
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except Exception:
+        return False
+
+
 def first_hop(host):
     """tracert 取第一跳 IP (用于判断该目的走直连还是 WARP 隧道)。"""
     import re
@@ -419,6 +664,144 @@ def first_hop(host):
     return None
 
 
+# ====================== DNS over HTTPS ======================
+# 系统 DNS 可能被污染, 或运营商返回伪造的 AAAA 记录(导致 happy eyeballs
+# 卡住)。自检时用 DoH 交叉验证, 能区分"分流没生效"和"DNS 被做了手脚"。
+DOH_ENDPOINTS = [
+    "https://cloudflare-dns.com/dns-query",
+    "https://doh.pub/dns-query",
+]
+# 用于 DNS 一致性检查的国内域名(必然是大陆 IP)
+DNS_CHECK_DOMAIN = "www.baidu.com"
+
+_cn_nets_cache = {"mtime": None, "nets": []}
+
+
+def cn_nets():
+    """加载并缓存大陆网段(已聚合排序), 供 IP 归属二分查找。"""
+    try:
+        mtime = os.path.getmtime(CHINA_LIST)
+    except Exception:
+        mtime = None
+    c = _cn_nets_cache
+    if c["nets"] and c["mtime"] == mtime:
+        return c["nets"]
+    nets = []
+    try:
+        with open(CHINA_LIST, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    nets.append(ipaddress.ip_network(line, strict=False))
+                except Exception:
+                    continue
+        nets = list(ipaddress.collapse_addresses(nets))
+    except Exception:
+        nets = []
+    c["nets"] = nets
+    c["mtime"] = mtime
+    return nets
+
+
+def is_cn_ip(ip):
+    """判断 IPv4 是否属于中国大陆地址段(二分查找)。"""
+    nets = cn_nets()
+    if not nets:
+        return False
+    try:
+        a = int(ipaddress.IPv4Address(ip))
+    except Exception:
+        return False
+    lo, hi = 0, len(nets) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        n = nets[mid]
+        if int(n.network_address) <= a <= int(n.broadcast_address):
+            return True
+        if a < int(n.network_address):
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return False
+
+
+def doh_resolve(hostname, timeout=4.0):
+    """用 DoH 解析域名, 只取 A 记录(IPv4 优先, 绕开伪造 AAAA)。失败返回 []。"""
+    import urllib.request
+    import urllib.parse
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
+    for ep in DOH_ENDPOINTS:
+        try:
+            url = ep + "?" + urllib.parse.urlencode({"name": hostname, "type": "A"})
+            req = urllib.request.Request(url, headers={
+                "accept": "application/dns-json",
+                "User-Agent": "Mozilla/5.0",
+            })
+            with opener.open(req, timeout=timeout) as r:
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            ips = []
+            for ans in data.get("Answer", []):
+                if ans.get("type") != 1:      # 1 = A
+                    continue
+                v = (ans.get("data") or "").strip()
+                try:
+                    ipaddress.IPv4Address(v)
+                    ips.append(v)
+                except Exception:
+                    continue
+            if ips:
+                return ips
+        except Exception:
+            continue
+    return []
+
+
+def check_dns():
+    """对比系统解析与 DoH 解析, 判断是否存在 DNS 污染。"""
+    res = {"domain": DNS_CHECK_DOMAIN, "system": [], "doh": [], "verdict": "unknown",
+           "msg": ""}
+    try:
+        infos = socket.getaddrinfo(DNS_CHECK_DOMAIN, 443, socket.AF_INET)
+        res["system"] = sorted({i[4][0] for i in infos})
+    except Exception as e:
+        res["msg"] = "系统解析失败: " + str(e)
+    res["doh"] = doh_resolve(DNS_CHECK_DOMAIN)
+    if not res["system"]:
+        res["verdict"] = "unknown"
+        return res
+
+    sys_cn = [ip for ip in res["system"] if is_cn_ip(ip)]
+    doh_cn = [ip for ip in res["doh"] if is_cn_ip(ip)]
+
+    if len(sys_cn) == len(res["system"]):
+        res["verdict"] = "ok"
+        res["msg"] = "系统解析结果全部落在大陆网段内, 未发现污染"
+    elif sys_cn:
+        res["verdict"] = "mixed"
+        res["msg"] = (f"系统解析混合返回 {len(sys_cn)} 个大陆节点与 "
+                      f"{len(res['system']) - len(sys_cn)} 个境外节点, 属正常(CDN 多节点), "
+                      "不影响分流判定")
+    elif doh_cn:
+        # 系统完全拿不到大陆地址、DoH 却能拿到 -> 强烈的污染特征
+        res["verdict"] = "polluted"
+        res["msg"] = (f"系统 DNS 把 {DNS_CHECK_DOMAIN} 全部解析到境外地址 "
+                      f"({', '.join(res['system'])}), 而 DoH 能解析出大陆地址 "
+                      f"({', '.join(doh_cn)}) —— 疑似 DNS 污染或被代理接管。"
+                      "延迟探测使用固定 IP, 因此不影响分流, 但建议检查 DNS 设置。")
+    else:
+        res["verdict"] = "overseas"
+        res["msg"] = ("系统与 DoH 的解析结果均为境外地址。可能是该域名使用境外 CDN, "
+                      "也可能是 DoH 出口在境外(Cloudflare DoH 常返回 103.235.x.x 香港节点)。")
+    return res
+
+
 def self_test():
     """只读自检: 验证分流是否真正生效 (不改变任何配置)。"""
     egress = get_egress_ip()
@@ -429,18 +812,21 @@ def self_test():
 
     cn_ip = "1.0.1.1"          # 在 china_cidr.txt 首段 (1.0.1.0/24) 内
     cn_hop = first_hop(cn_ip)
-    cn_direct = False
-    if cn_hop:
-        try:
-            cn_direct = ipaddress.ip_address(cn_hop).is_private
-        except Exception:
-            cn_direct = False
+    cn_direct = bool(cn_hop) and is_private_ip(cn_hop)
 
     fx_ip = "8.8.8.8"          # 不在国内列表 -> 应走 WARP
     fx_hop = first_hop(fx_ip)
     fx_via_warp = bool(fx_hop) and is_cloudflare_ip(fx_hop)
 
     is_cf = is_cloudflare_ip(egress)
+
+    # 私有网段是否已被排除(局域网设备可达性)
+    lan_hop = first_hop("192.168.1.1")
+    lan_ok = bool(lan_hop) and is_private_ip(lan_hop)
+
+    # DNS 一致性(区分"分流没生效"与"DNS 被污染")
+    dns = check_dns()
+
     verdict = connected and is_cf and cli_count > 0 and cn_direct
     return {
         "verdict": "PASS" if verdict else "FAIL",
@@ -450,6 +836,10 @@ def self_test():
         "cli_exclude_count": cli_count,
         "china_test": {"ip": cn_ip, "first_hop": cn_hop, "direct": cn_direct},
         "foreign_test": {"ip": fx_ip, "first_hop": fx_hop, "via_warp": fx_via_warp},
+        "reserved_total": len(ALWAYS_DIRECT),
+        "lan_test": {"probe": "192.168.1.1", "first_hop": lan_hop, "reachable": lan_ok,
+                     "reserved_excluded": sorted(set(get_cli_excludes()) & _ALWAYS_DIRECT_SET)},
+        "dns": dns,
         "msg": "" if verdict else "未通过：请确认 WARP 已连接、出口 IP 属于 Cloudflare、国内规则已注入且中国 IP 走本地网关直连。",
     }
 
@@ -547,14 +937,35 @@ def enable_split():
             raise RuntimeError("未找到 warp-cli.exe，请确认 Cloudflare WARP 已安装")
         log("WARP 路径: " + cli)
 
+        all_ranges = read_active_ranges()
+        if MAX_RANGES > 0:
+            all_ranges = all_ranges[:MAX_RANGES]
+        if not all_ranges:
+            raise RuntimeError("规则列表为空，请点击『更新中国IP列表』或导入规则")
+
+        # ---- 顺序是关键: 先把排除规则全部写好, 最后一步才连上 WARP ----
+        # 旧流程是「先 connect 再逐条注入」, 5440 条要 8 分钟以上; 这期间隧道
+        # 已建立但排除列表几乎是空的, 国内流量全被灌进隧道 -> 用户看到的就是
+        # 「一注入就断网」。现在把注入放在断开状态做, 此时网络是纯直连,
+        # 用户在启用过程中完全无感; 规则齐了再连接, 一步到位。
         warp(["disconnect"], timeout=20)
-        time.sleep(2)
+        time.sleep(1)
 
         ok, out = warp(["mode", "warp"], timeout=20)
         if not ok:
             log("设置 mode warp 返回: " + out, logging.WARNING)
         else:
             log("mode warp 设置完成")
+
+        with state_lock:
+            state["progress"] = {"total": 0, "done": 0, "phase": "正在写入分流规则..."}
+        ok_sync, msg = sync_excludes(all_ranges, prune=False, phase_cb=_set_phase)
+        if not ok_sync:
+            raise RuntimeError("分流规则写入失败: " + msg)
+        log("规则就绪 -> " + msg)
+
+        if op_stop.is_set():
+            raise RuntimeError("用户取消了操作")
 
         connected, last_out = connect_warp(update_phase=True)
         if not connected:
@@ -563,67 +974,26 @@ def enable_split():
                 " | 常见原因: 到 Cloudflare WARP 端点(162.159.x.x:443)的握手被网络阻断, 或 IPv6 探测(happy eyeballs)卡住。"
                 "建议: 多试 1-2 次; 或在『网络适配器 -> CloudflareWARP -> 属性』取消 IPv6 勾选后重试; 确认 WARP 账号可用。"
             )
-        log("WARP 已连接")
-
-        ranges = read_active_ranges()
-        if MAX_RANGES > 0:
-            ranges = ranges[:MAX_RANGES]
-        total = len(ranges)
-        if total == 0:
-            raise RuntimeError("规则列表为空，请点击『更新中国IP列表』或导入规则")
-        log(f"准备注入 {total} 条分流规则 (并发 {WORKERS})")
-        with state_lock:
-            state["progress"] = {"total": total, "done": 0, "phase": "注入分流规则..."}
-
-        added = []
-        done_cnt = 0
-        done_lock = threading.Lock()
-
-        def do_add(c):
-            if op_stop.is_set():
-                return False
-            for _ in range(2):
-                ok, out = warp(["tunnel", "ip", "add-range", c], timeout=20)
-                if ok:
-                    return True
-                if "already" in out.lower():
-                    return True
-                low = out.lower()
-                if any(k in low for k in ["not allowed", "not permitted", "policy",
-                                          "organization", "managed by", "team", "locked"]):
-                    with state_lock:
-                        state["zerotrust_locked"] = True
-                    log("检测到 Zero Trust 策略锁定 split-tunnel: " + out[:120], logging.ERROR)
-                    return False
-                time.sleep(0.3)
-            return False
-
-        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            futures = {ex.submit(do_add, c): c for c in ranges}
-            for f in futures:
-                if f.result():
-                    added.append(futures[f])
-                with done_lock:
-                    done_cnt += 1
-                    if done_cnt % 100 == 0 or done_cnt == total:
-                        with state_lock:
-                            state["progress"]["done"] = done_cnt
-
-        if op_stop.is_set():
-            raise RuntimeError("用户取消了操作")
+        log("WARP 已连接, 分流规则已生效")
+        total = len(all_ranges)
 
         with state_lock:
             state["enabled"] = True
+            state["armed"] = True            # 本次会话已确认, 允许后续自动重连
+            state["resume_pending"] = False
+            state["auto_restored"] = False   # 手动重新启用后清除自愈还原提示
             state["progress"] = {"total": total, "done": total, "phase": "分流已启用"}
         save_state()
-        log(f"分流启用完成: 成功注入 {len(added)}/{total} 条规则 (其余已存在或被跳过)")
+        log(f"分流启用完成: {total} 条规则已就位, daemon 现有排除 "
+            f"{len(get_cli_excludes())} 条")
     except Exception as e:
         log("启用失败: " + str(e), logging.ERROR)
         with state_lock:
             state["error"] = str(e)
         try:
+            # 只断开, 不清规则 —— 规则留着, 用户重试时可以直接秒级启用;
+            # (旧代码在这里做 tunnel ip reset, 导致每次失败重试都要重注 8 分钟)
             warp(["disconnect"], timeout=20)
-            warp(["tunnel", "ip", "reset"], timeout=20)
         except Exception:
             pass
         with state_lock:
@@ -635,7 +1005,14 @@ def enable_split():
 
 
 def disable_split():
-    """停用分流: 清空自定义排除 + 断开, 网络恢复正常。"""
+    """停用分流: 断开隧道, 网络恢复纯直连。
+
+    刻意不再做 `tunnel ip reset`:
+      - 排除规则只在隧道建立时才起作用, 断开后它们完全不影响直连网络;
+      - 保留规则后「再次启用」可以秒级完成, 而不是重新注入 8 分钟;
+      - 这正是「每次重启都要重新注入、启动特别慢」的根因之一。
+    想彻底清空规则请用「一键还原」(它会 reset)。
+    """
     with state_lock:
         if state["running"]:
             return
@@ -644,13 +1021,13 @@ def disable_split():
         state["progress"] = {"total": 0, "done": 0, "phase": "正在关闭分流..."}
     log("开始停用分流...")
     try:
-        warp(["tunnel", "ip", "reset"], timeout=30)
         warp(["disconnect"], timeout=20)
         with state_lock:
             state["enabled"] = False
+            state["armed"] = False
             state["progress"] = {"total": 0, "done": 0, "phase": "已停用，网络恢复正常"}
         save_state()
-        log("分流已停用，网络恢复正常")
+        log("分流已停用，网络恢复直连 (排除规则已保留, 再次启用可秒级完成)")
     except Exception as e:
         log("停用失败: " + str(e), logging.ERROR)
         with state_lock:
@@ -662,7 +1039,7 @@ def disable_split():
 
 
 def restore():
-    """一键还原 (紧急): 终止正在进行的操作, 强制断开 + 重置, 回到干净状态。"""
+    """一键还原 (紧急): 终止正在进行的操作, 强制断开, 清空自定义排除, 回到干净状态。"""
     log("执行一键还原...")
     op_stop.set()
     for _ in range(100):
@@ -673,11 +1050,21 @@ def restore():
     op_stop.clear()
     try:
         warp(["disconnect"], timeout=20)
-        warp(["tunnel", "ip", "reset"], timeout=30)
     except Exception:
         pass
+    # 优先用配置直写把 CLI 排除清空 —— 秒级完成, 且保留 daemon 自带的默认
+    # 排除(Apple 服务/组播等); 直写不可用时回退到官方 reset。
+    ok, msg = write_excludes_fast([])
+    if not ok:
+        log("配置直写清空失败, 回退 tunnel ip reset: " + msg, logging.WARNING)
+        try:
+            warp(["tunnel", "ip", "reset"], timeout=30)
+        except Exception:
+            pass
     with state_lock:
         state["enabled"] = False
+        state["armed"] = False
+        state["resume_pending"] = False
         state["error"] = None
         state["reconnecting"] = False
         state["progress"] = {"total": 0, "done": 0, "phase": "已还原 (干净状态)"}
@@ -752,22 +1139,120 @@ def get_cli_excludes():
 def apply_diff_rules():
     """后台自动更新: 重新拉取最新列表, 对 daemon 排除列表做增量 diff (新增/删除)。"""
     try:
-        old = read_active_ranges()
         refresh_list_data()
-        new = read_active_ranges()
-        current = get_cli_excludes()
-        desired = set(new)
-        to_add = desired - current
-        to_del = current - desired
-        if to_del:
-            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                list(ex.map(lambda c: warp(["tunnel", "ip", "remove-range", c], timeout=15), to_del))
-        if to_add:
-            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                list(ex.map(lambda c: warp(["tunnel", "ip", "add-range", c], timeout=15), to_add))
-        log(f"后台自动更新规则完成: 新增 {len(to_add)} 条, 移除 {len(to_del)} 条")
+        ok, msg = sync_excludes(read_active_ranges(), prune=True, phase_cb=_set_phase)
+        log("后台自动更新规则: " + msg, logging.INFO if ok else logging.WARNING)
     except Exception as e:
         log("后台自动更新规则失败: " + str(e), logging.WARNING)
+
+
+def _set_phase(text):
+    with state_lock:
+        state["progress"]["phase"] = text
+
+
+def sync_excludes(desired, prune=False, phase_cb=None, quiet=False):
+    """把 daemon 的 CLI 排除列表同步成 desired。返回 (ok, 说明文字)。
+
+    - 增量: 只补差的、只删多的, 已经存在的规则一条都不重复注入。
+    - 大数据量走"配置直写"(停服务改写 -> 起服务, 秒级); 小增量走逐条 CLI。
+    - 完成后回查 daemon 校验, 不会"以为成功了其实没生效"。
+
+    prune=False 时只增不删 (用于启用分流: 保留多余规则无害, 且能避免
+    每次启用都产生写放大)。
+    """
+    want = list(dict.fromkeys(desired))
+    current = get_cli_excludes()
+    want_set = set(want)
+
+    to_add = [c for c in want if c not in current]
+    to_del = [c for c in current if c not in want_set] if prune else []
+
+    if not to_add and not to_del:
+        return True, f"规则已是最新(daemon 现有 {len(current)} 条), 无需注入"
+
+    target = want if prune else list(dict.fromkeys(list(current) + want))
+
+    mode = "skip"
+    if len(to_add) >= FAST_WRITE_MIN or len(to_del) >= FAST_WRITE_MIN:
+        if phase_cb:
+            phase_cb(f"正在写入 {len(target)} 条规则...")
+        ok, msg = write_excludes_fast(target, phase_cb=phase_cb)
+        if ok:
+            mode = "fast"
+        else:
+            log(f"配置直写不可用, 回退逐条注入: {msg}", logging.WARNING)
+            mode = "cli"
+    else:
+        mode = "cli"
+
+    if mode == "cli":
+        fails = []
+
+        def add_one(c):
+            if op_stop.is_set():
+                return
+            is_reserved = c in _ALWAYS_DIRECT_SET
+            for _ in range(2):
+                ok1, out = warp(["tunnel", "ip", "add-range", c], timeout=20)
+                if ok1 or "already" in out.lower():
+                    return
+                low = out.lower()
+                if any(k in low for k in ["not allowed", "not permitted", "policy",
+                                          "organization", "managed by", "team", "locked"]):
+                    if is_reserved:
+                        return
+                    with state_lock:
+                        state["zerotrust_locked"] = True
+                    log("检测到 Zero Trust 策略锁定 split-tunnel: " + out[:120], logging.ERROR)
+                    return
+                time.sleep(0.3)
+            fails.append(c)
+
+        if to_add:
+            if phase_cb:
+                phase_cb(f"注入 {len(to_add)} 条新增规则...")
+            with state_lock:
+                state["progress"] = {"total": len(to_add), "done": 0,
+                                     "phase": f"注入 {len(to_add)} 条新增规则..."}
+            done = [0]
+
+            def add_counted(c):
+                add_one(c)
+                done[0] += 1
+                if done[0] % 50 == 0 or done[0] == len(to_add):
+                    with state_lock:
+                        state["progress"]["done"] = done[0]
+
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                list(ex.map(add_counted, to_add))
+
+        if to_del:
+            if phase_cb:
+                phase_cb(f"移除 {len(to_del)} 条失效规则...")
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                list(ex.map(lambda c: warp(["tunnel", "ip", "remove-range", c], timeout=15),
+                            to_del))
+
+    # ---- 回查校验, 不轻信返回码 ----
+    actual = get_cli_excludes()
+    missing = [c for c in want if c not in actual]
+    if missing:
+        ratio = len(missing) / max(len(want), 1)
+        if ratio > 0.02:
+            return False, (f"校验失败: {len(missing)}/{len(want)} 条规则未生效"
+                           f"({ratio:.1%})。首个缺失: {missing[0]}。"
+                           "可能原因: Zero Trust 策略限制 / daemon 异常 / 规则数超限。")
+        log(f"校验: {len(missing)} 条未生效(占比 {ratio:.1%}, 已放行)", logging.WARNING)
+
+    parts = []
+    if to_add:
+        parts.append(f"新增 {len(to_add)}")
+    if to_del:
+        parts.append(f"移除 {len(to_del)}")
+    how = "配置直写" if mode == "fast" else ("逐条注入" if mode == "cli" else "无需写入")
+    summary = "/".join(parts) or "无变化"
+    return True, f"{how}: {summary}, daemon 现有 {len(actual)} 条"
 
 
 def refresh_list_data():
@@ -882,9 +1367,15 @@ def reconnect_loop():
         try:
             if not settings.get("auto_reconnect", True):
                 continue
-            if not state["enabled"]:
+            if not state["enabled"] or state["running"]:
                 continue
-            if state["running"]:
+            # 冷启动保护 (解决「我都退出程序了, 它怎么又自己启动了」):
+            # state.enabled 是从 state.json 读出来的「上次会话的状态」, 新进程
+            # 刚起来时它天然为 True。若不加区分就自动重连+注入, 用户会觉得
+            # 程序在背着他自己动网络。只有本次会话确认过状态(armed)才允许
+            # 自动重连; armed 在「用户手动启用成功」或「启动校对时发现 daemon
+            # 确实已在连接状态」时才置位。
+            if not state.get("armed"):
                 continue
             ok, out = warp(["status"], timeout=10)
             if "Connected" in out:
@@ -898,17 +1389,153 @@ def reconnect_loop():
             with state_lock:
                 state["reconnecting"] = False
             if connected:
-                log("WARP 已自动重连, 重新注入分流规则...")
-                # 重连后排除规则可能丢失, 重新注入
-                ranges = read_active_ranges()
-                if MAX_RANGES > 0:
-                    ranges = ranges[:MAX_RANGES]
-                for c in ranges:
-                    warp(["tunnel", "ip", "add-range", c], timeout=15)
+                # 只补差集。旧代码在这里对 5440 条做串行 add-range, 一旦触发
+                # 就是十几分钟, 而且是在隧道已经连上的状态下做 —— 用户直接断网。
+                try:
+                    ok2, msg = sync_excludes(read_active_ranges(), prune=False,
+                                             phase_cb=_set_phase)
+                    log("WARP 已自动重连; 规则同步: " + msg,
+                        logging.INFO if ok2 else logging.WARNING)
+                except Exception as e:
+                    log("重连后同步规则失败: " + str(e), logging.WARNING)
             else:
                 log("自动重连失败: " + last[:120], logging.ERROR)
         except Exception as e:
             log("reconnect loop err: " + str(e), logging.WARNING)
+
+
+def reconcile_state_on_startup():
+    """启动后校对「上次留下的 enabled 标志」与「daemon 的真实状态」。
+
+    这是「退出程序后它自己又启动」的另一半答案: 旧版把 state.json 里的
+    enabled=true 当成当前事实, 于是新进程一起来就自动重连 WARP、自动注入
+    规则, 用户看起来就是「我没点它, 它自己动了」。
+
+    新的判定:
+      - daemon 确实处于连接状态 -> 说明分流本来就在生效, 认定为已启用;
+      - daemon 未连接 -> 不擅自动手。默认只提示, 由用户点开关恢复
+        (规则已留在 daemon 里, 恢复是秒级的); 只有用户显式打开
+        『启动时自动恢复』才会自动执行。
+    """
+    time.sleep(6)
+    try:
+        ok, out = warp(["status"], timeout=15)
+        connected = "Connected" in out
+        n = len(get_cli_excludes())
+        if not state["enabled"]:
+            return
+        if connected:
+            with state_lock:
+                state["armed"] = True
+            log(f"已确认上次的分流仍在生效 (WARP 已连接, daemon 排除规则 {n} 条)")
+            return
+        if settings.get("auto_resume", False):
+            with state_lock:
+                state["armed"] = True
+            log("按『启动时自动恢复』设置, 正在恢复上次的分流状态...")
+            threading.Thread(target=enable_split, daemon=True).start()
+            return
+        with state_lock:
+            state["enabled"] = False
+            state["resume_pending"] = True
+            state["progress"] = {"total": 0, "done": 0,
+                                 "phase": "上次的分流未自动恢复, 点开关即可秒级恢复"}
+        save_state()
+        log(f"上次会话启用了分流, 但当前 WARP 未连接 —— 已暂停自动恢复, "
+            f"等你手动确认 (daemon 中已保留 {n} 条规则, 恢复约 1 秒)")
+    except Exception as e:
+        log("启动状态校对失败: " + str(e), logging.WARNING)
+
+
+# ====================== 可用性优先: 自动自愈 ======================
+# 借鉴 net-warp「直连失败自动回退隧道」的取舍哲学: 分流判定出错时,
+# 宁可放弃加速也不能断网。这里做成三级:
+#   1) 采样连续失败 -> 自动重连 WARP 并重新注入规则
+#   2) 自愈反复无效 -> 自动还原为直连(保可用, 放弃加速)
+#   3) 每一步都写日志, 控制台可见, 不做静默操作
+heal = {
+    "fail_streak": 0,      # 连续采样失败次数
+    "attempts": 0,         # 本轮已自愈次数
+    "last_ts": 0.0,        # 上次自愈时间(冷却用)
+    "last_action": "",     # 最近一次自愈结果(给控制台展示)
+    "active": False,       # 正在自愈中
+}
+heal_lock = threading.Lock()
+HEAL_FAIL_THRESHOLD = int(os.environ.get("WARP_SPLIT_HEAL_FAILS", "4"))  # 约 12 秒
+HEAL_COOLDOWN = 90        # 两次自愈之间的最小间隔(秒)
+HEAL_MAX_ATTEMPTS = 3     # 连续自愈超过该次数仍无效 -> 自动还原
+
+
+def reconnect_and_reinject():
+    """重连 WARP 并同步分流规则(只补差集)。成功返回 True。"""
+    try:
+        connected, last = connect_warp(max_attempts=3, update_phase=False)
+        if not connected:
+            log("自愈重连失败: " + last[:140], logging.WARNING)
+            return False
+        ranges = read_active_ranges()
+        if MAX_RANGES > 0:
+            ranges = ranges[:MAX_RANGES]
+        if not ranges:
+            return True
+        ok, msg = sync_excludes(ranges, prune=False, phase_cb=_set_phase)
+        log("自愈规则同步: " + msg, logging.INFO if ok else logging.WARNING)
+        return ok
+    except Exception as e:
+        log("自愈重连异常: " + str(e), logging.WARNING)
+        return False
+
+
+def self_heal_loop():
+    while not EXIT_EVENT.is_set():
+        EXIT_EVENT.wait(3)
+        try:
+            if not settings.get("auto_heal", True):
+                continue
+            if not state["enabled"] or state["running"] or state["reconnecting"]:
+                with heal_lock:
+                    heal["fail_streak"] = 0
+                    heal["attempts"] = 0
+                continue
+            with heal_lock:
+                streak = heal["fail_streak"]
+                if streak < HEAL_FAIL_THRESHOLD:
+                    continue
+                now = time.time()
+                if now - heal["last_ts"] < HEAL_COOLDOWN:
+                    continue
+                heal["last_ts"] = now
+                heal["active"] = True
+                heal["attempts"] += 1
+                attempts = heal["attempts"]
+                heal["fail_streak"] = 0
+
+            log(f"连续 {streak} 次采样失败, 触发自动自愈(第 {attempts} 次)...", logging.WARNING)
+
+            if attempts > HEAL_MAX_ATTEMPTS:
+                log("自愈反复无效, 判定分流当前不可用 —— 自动还原为直连以保证网络可用",
+                    logging.ERROR)
+                with heal_lock:
+                    heal["last_action"] = "已自动还原为直连"
+                    heal["attempts"] = 0
+                    heal["active"] = False
+                with state_lock:
+                    state["auto_restored"] = True
+                restore()
+                continue
+
+            ok = reconnect_and_reinject()
+            with heal_lock:
+                heal["last_action"] = "重连并重新注入成功" if ok else "自愈尝试失败"
+                if ok:
+                    heal["attempts"] = 0
+                heal["active"] = False
+            log("自动自愈" + ("成功, 分流已恢复" if ok else "失败, 将在冷却后重试"),
+                logging.INFO if ok else logging.WARNING)
+        except Exception as e:
+            log("自愈线程异常: " + str(e), logging.WARNING)
+            with heal_lock:
+                heal["active"] = False
 
 
 def autoupdate_loop():
@@ -1019,13 +1646,13 @@ def measure_speed(url, dur=4):
 def egress_loop():
     """独立线程: 每 30s 刷新出口 IP, 避免拖慢延迟采样循环。"""
     while not EXIT_EVENT.is_set():
-        EXIT_EVENT.wait(30)
         try:
-            ip = get_egress_ip()
+            ip = get_egress_ip(ttl=0)   # 本循环自行控制刷新节奏
             with metrics_lock:
                 metrics["egress_ip"] = ip
         except Exception:
             pass
+        EXIT_EVENT.wait(30)
 
 
 def metrics_loop():
@@ -1035,6 +1662,13 @@ def metrics_loop():
         try:
             lat_cn = probe_latency(CN_PROBES)
             lat_intl = probe_latency(INTL_PROBES, http_fallback=intl_url)
+            # 可用性监测: 分流启用时国内外探测同时全部失败 => 疑似隧道/路由异常,
+            # 累加失败计数交给 self_heal_loop 处理(仅计数, 不在此阻塞)。
+            with heal_lock:
+                if state["enabled"] and lat_cn is None and lat_intl is None:
+                    heal["fail_streak"] += 1
+                else:
+                    heal["fail_streak"] = 0
             with metrics_lock:
                 metrics["latency_cn"] = lat_cn
                 metrics["latency_intl"] = lat_intl
@@ -1140,6 +1774,7 @@ def get_status():
             "mode": mode,
             "cli_exclude_count": cli_count,
             "list_total": len(read_active_ranges()),
+            "reserved_total": len(ALWAYS_DIRECT),
             "egress_ip": egress,
             "enabled": state["enabled"],
             "running": state["running"],
@@ -1151,6 +1786,12 @@ def get_status():
             "warp_cli": find_warp_cli() or "",
             "max_ranges_test": MAX_RANGES,
             "auto_reconnect": settings.get("auto_reconnect", True),
+            "auto_heal": settings.get("auto_heal", True),
+            "auto_resume": settings.get("auto_resume", False),
+            "resume_pending": state.get("resume_pending", False),
+            "fast_write": os.path.exists(warp_conf_path()),
+            "heal": dict(heal),
+            "auto_restored": state.get("auto_restored", False),
             "auto_update": settings.get("auto_update", False),
             "metrics_speed": settings.get("metrics_speed", True),
             "tray": settings.get("tray", True),
@@ -1631,7 +2272,8 @@ class Handler(BaseHTTPRequestHandler):
             ok, out = fix_ipv6()
             self._json({"ok": ok, "msg": out})
         elif p == "/api/settings":
-            for k in ("theme", "auto_reconnect", "auto_update", "metrics_speed", "tray"):
+            for k in ("theme", "auto_reconnect", "auto_heal", "auto_update",
+                      "auto_resume", "metrics_speed", "tray"):
                 if k in payload:
                     settings[k] = payload[k]
             save_settings()
@@ -1763,12 +2405,19 @@ def main():
     log(f"监听 http://127.0.0.1:{PORT}/  (工作目录: {APP_DIR})")
     if MAX_RANGES > 0:
         log(f"[测试模式] 仅注入前 {MAX_RANGES} 条规则")
+    if os.path.exists(warp_conf_path()):
+        log(f"已启用秒级注入通道 (配置直写: {warp_conf_path()})")
+    else:
+        log(f"未找到 WARP 配置 {warp_conf_path()}, 将使用逐条注入(较慢)", logging.WARNING)
 
     # 启动后台守护线程
     threading.Thread(target=metrics_loop, daemon=True).start()
     threading.Thread(target=reconnect_loop, daemon=True).start()
+    threading.Thread(target=self_heal_loop, daemon=True).start()
     threading.Thread(target=autoupdate_loop, daemon=True).start()
     threading.Thread(target=egress_loop, daemon=True).start()
+    # 校对上次留下的 enabled 标志, 避免"一启动就自己动网络"
+    threading.Thread(target=reconcile_state_on_startup, daemon=True).start()
 
     try:
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

@@ -69,6 +69,7 @@ echo.
     --icon "tools\warp.ico" ^
     --add-data "index.html;." ^
     --add-data "china_cidr.txt;." ^
+    --add-data "china_cidr_lite.txt;." ^
     --hidden-import "ctypes" ^
     --hidden-import "ctypes.wintypes" ^
     --hidden-import "ipaddress" ^

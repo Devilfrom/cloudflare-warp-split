@@ -5,7 +5,7 @@ a = Analysis(
     ['warp_split.py'],
     pathex=[],
     binaries=[],
-    datas=[('index.html', '.'), ('china_cidr.txt', '.')],
+    datas=[('index.html', '.'), ('china_cidr.txt', '.'), ('china_cidr_lite.txt', '.')],
     hiddenimports=['ctypes', 'ctypes.wintypes', 'ipaddress'],
     hookspath=[],
     hooksconfig={},

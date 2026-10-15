@@ -8,6 +8,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# WARP 配置改写前的自动备份（含本机 WARP 配置）
+warp_settings.backup.json
+*.backup.json
+tools/*.bak
+
 # 本机个人配置与自定义规则列表（因人而异，勿提交）
 settings.json
 rules/
