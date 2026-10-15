@@ -28,6 +28,7 @@ import subprocess
 import logging
 import webbrowser
 import ctypes
+import ctypes.wintypes  # 必须显式导入: MSG/POINT 等类型在此子模块, 仅 import ctypes 不会加载
 import ipaddress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -1242,9 +1243,11 @@ class TrayApp:
             try:
                 if msg == self.WM_SHELL:
                     event = lparam & 0xFFFF
-                    if event == 0x0203:      # WM_LBUTTONDBLCLK
+                    if event == 0x0202:      # WM_LBUTTONUP  单击 -> 打开面板
                         self._open()
-                    elif event == 0x0205:    # WM_RBUTTONUP
+                    elif event == 0x0203:    # WM_LBUTTONDBLCLK 双击 -> 打开面板
+                        self._open()
+                    elif event == 0x0205:    # WM_RBUTTONUP  右键 -> 菜单
                         self._show_menu()
                     return 0
                 if msg == WM_COMMAND:
@@ -1330,10 +1333,17 @@ class TrayApp:
             log("托盘 update 异常: " + str(e), logging.DEBUG)
 
     def _open(self):
+        # 单击会先于双击触发, 做 1.2s 防抖, 避免一次双击打开两个标签页
+        now = time.time()
+        if now - getattr(self, "_last_open", 0) < 1.2:
+            return
+        self._last_open = now
         try:
-            webbrowser.open(self.url)
-        except Exception:
-            pass
+            ok = webbrowser.open(self.url)
+            if not ok:
+                log("托盘: 未能自动打开浏览器, 请手动访问 " + self.url, logging.WARNING)
+        except Exception as e:
+            log("托盘打开面板失败: " + str(e), logging.WARNING)
 
     def _show_menu(self):
         user32 = ctypes.windll.user32
