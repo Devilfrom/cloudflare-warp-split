@@ -26,6 +26,33 @@ import struct
 import shutil
 import threading
 import subprocess
+
+# ====================== 子进程无窗口启动 ======================
+# 必须统一走 _run(): 打包后的程序是 --windowed(无控制台), 此时任何
+# subprocess 调用都会新建一个黑色控制台窗口并瞬间消失。守护线程
+# (断线重连/延迟探测/出口IP/规则更新)是周期性调用的, 于是黑窗口
+# 不停地闪 —— 表现为「cmd 蹦迪」。
+_IS_WIN = (os.name == "nt")
+_NO_WINDOW_FLAGS = 0x08000000 if _IS_WIN else 0   # CREATE_NO_WINDOW
+
+if _IS_WIN:
+    _SI = subprocess.STARTUPINFO()
+    _SI.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    _SI.wShowWindow = 0                        # SW_HIDE
+else:
+    _SI = None
+
+
+def _run(cmd, **kw):
+    """subprocess.run 的包装: Windows 下强制隐藏控制台窗口。
+
+    其余行为与 subprocess.run 完全一致, 返回值对象的
+    .returncode / .stdout / .stderr 用法不变。
+    """
+    if _IS_WIN:
+        kw.setdefault("startupinfo", _SI)
+        kw.setdefault("creationflags", _NO_WINDOW_FLAGS)
+    return subprocess.run(cmd, **kw)
 import logging
 import webbrowser
 import ctypes
@@ -70,6 +97,21 @@ def pause(msg="按回车退出..."):
         if sys.stdin is None or sys.stdin.closed or not sys.stdin.isatty():
             return
         input(msg)
+    except Exception:
+        pass
+
+
+def alert(msg, title="Cloudflare WARP 分流控制台"):
+    """向用户显示错误提示。
+
+    打包为窗口模式后没有控制台, 打印到 stdout 用户是看不到的, 提权失败
+    这类致命错误必须用消息框弹出来, 否则表现为「双击后毫无反应」。
+    """
+    try:
+        if IS_FROZEN:
+            ctypes.windll.user32.MessageBoxW(None, msg, title, 0x10)  # MB_ICONERROR
+        else:
+            print(msg)
     except Exception:
         pass
 
@@ -174,7 +216,7 @@ def find_warp_cli():
         if os.path.exists(p):
             return p
     try:
-        r = subprocess.run(["where", "warp-cli"], capture_output=True, text=True, timeout=10)
+        r = _run(["where", "warp-cli"], capture_output=True, text=True, timeout=10)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip().splitlines()[0]
     except Exception:
@@ -188,7 +230,7 @@ def warp(args, timeout=30):
     if not cli:
         return False, "warp-cli 未找到"
     try:
-        r = subprocess.run([cli] + args, capture_output=True, text=True, timeout=timeout)
+        r = _run([cli] + args, capture_output=True, text=True, timeout=timeout)
         out = (r.stdout or "") + (r.stderr or "")
         return r.returncode == 0, out.strip()
     except subprocess.TimeoutExpired:
@@ -200,9 +242,9 @@ def warp(args, timeout=30):
 def restart_warp_service():
     """重启 CloudflareWARP 服务, 用于清除卡死的 daemon 状态 (happy eyeballs 卡住时兜底)。"""
     try:
-        subprocess.run(["net", "stop", "CloudflareWARP"], capture_output=True, text=True, timeout=30)
+        _run(["net", "stop", "CloudflareWARP"], capture_output=True, text=True, timeout=30)
         time.sleep(3)
-        subprocess.run(["net", "start", "CloudflareWARP"], capture_output=True, text=True, timeout=30)
+        _run(["net", "start", "CloudflareWARP"], capture_output=True, text=True, timeout=30)
         time.sleep(5)
         return True
     except Exception as e:
@@ -348,7 +390,7 @@ def first_hop(host):
     """tracert 取第一跳 IP (用于判断该目的走直连还是 WARP 隧道)。"""
     import re
     try:
-        r = subprocess.run(["tracert", "-d", "-h", "2", "-w", "700", host],
+        r = _run(["tracert", "-d", "-h", "2", "-w", "700", host],
                            capture_output=True, text=True, timeout=20, errors="ignore")
         for ln in r.stdout.splitlines():
             s = ln.strip()
@@ -400,7 +442,7 @@ def fix_ipv6():
     """禁用 CloudflareWARP 虚拟适配器的 IPv6, 解决 WARP 连接卡在 happy eyeballs 的问题。"""
     import re
     try:
-        r = subprocess.run(["netsh", "interface", "ipv6", "show", "interfaces"],
+        r = _run(["netsh", "interface", "ipv6", "show", "interfaces"],
                            capture_output=True, text=True, timeout=20, errors="ignore")
         idx = None
         for ln in r.stdout.splitlines():
@@ -411,7 +453,7 @@ def fix_ipv6():
                     break
         if not idx:
             return False, "未找到 CloudflareWARP 适配器 (接口名可能不是 CloudflareWARP)"
-        res = subprocess.run(["netsh", "interface", "ipv6", "set", "interface", idx, "disabled"],
+        res = _run(["netsh", "interface", "ipv6", "set", "interface", idx, "disabled"],
                              capture_output=True, text=True, timeout=20, errors="ignore")
         if res.returncode != 0:
             return False, (res.stdout + res.stderr).strip() or "netsh 返回非零"
@@ -877,7 +919,7 @@ def autoupdate_loop():
 def ping_host(host, timeout_ms=1000):
     """返回延迟(ms) 或 None。"""
     try:
-        r = subprocess.run(["ping", "-n", "1", "-w", str(timeout_ms), host],
+        r = _run(["ping", "-n", "1", "-w", str(timeout_ms), host],
                            capture_output=True, text=True, timeout=8, errors="ignore")
         import re
         m = re.search(r"(?:时间|time)[=<]\s*(\d+(?:\.\d+)?)\s*ms", r.stdout, re.IGNORECASE)
@@ -1001,7 +1043,7 @@ def metrics_loop():
 # ====================== 开机自启 (计划任务) ======================
 def autostart_enabled():
     try:
-        r = subprocess.run(["schtasks", "/query", "/tn", AUTOSTART_TASK, "/fo", "LIST"],
+        r = _run(["schtasks", "/query", "/tn", AUTOSTART_TASK, "/fo", "LIST"],
                            capture_output=True, text=True, timeout=15)
         return r.returncode == 0
     except Exception:
@@ -1013,7 +1055,7 @@ def register_autostart():
     script = os.path.abspath(__file__)
     # /tr 用列表传入, 避免 shell 引号问题
     tr = '"%s" "%s" --tray' % (py, script)
-    r = subprocess.run(
+    r = _run(
         ["schtasks", "/create", "/tn", AUTOSTART_TASK, "/tr", tr,
          "/sc", "onlogon", "/rl", "highest", "/f"],
         capture_output=True, text=True, timeout=30)
@@ -1021,7 +1063,7 @@ def register_autostart():
 
 
 def unregister_autostart():
-    r = subprocess.run(["schtasks", "/delete", "/tn", AUTOSTART_TASK, "/f"],
+    r = _run(["schtasks", "/delete", "/tn", AUTOSTART_TASK, "/f"],
                        capture_output=True, text=True, timeout=30)
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
@@ -1637,8 +1679,10 @@ def run_as_admin():
     而子进程又因仍是普通权限再次走提权分支, 形成无限重启。
     """
     args = [a for a in sys.argv[1:] if a != ELEVATED_FLAG]
-    parts = ['"%s"' % sys.executable] + ['"%s"' % a for a in args] + [ELEVATED_FLAG]
-    params = " ".join(parts)
+    # 注意: ShellExecuteW 的 lpFile 已经是程序自身路径, lpParameters 里
+    # 只能放参数。若再拼一次 exe 路径, 实际命令行会变成
+    # `程序.exe "程序.exe" --elevated`, 多出一个位置参数。
+    params = " ".join(['"%s"' % a for a in args] + [ELEVATED_FLAG])
     try:
         r = _shell_execute(None, "runas", sys.executable, params, None, 1)
     except Exception as e:
@@ -1665,15 +1709,19 @@ def main():
             # 无限弹窗。这里明确报错并退出, 由用户手动以管理员运行。
             log("提权后仍非管理员权限。可能系统禁用了 UAC(账户控制), "
                 "或提权请求被安全软件拦截。", logging.ERROR)
-            log("请右键本程序 →「以管理员身份运行」; "
-                "或在「设置 → 账户 → 用户账户控制」中把 UAC 调回默认级别。",
-                logging.ERROR)
+            alert("提权后仍非管理员权限。\n\n"
+                  "可能原因: 系统禁用了 UAC(用户账户控制), 或提权请求被安全软件拦截。\n\n"
+                  "请右键本程序 →「以管理员身份运行」; 或在 Windows「用户账户控制设置」"
+                  "中把 UAC 调回默认级别。")
             pause()
             sys.exit(1)
 
         log("当前非管理员, 尝试提权...")
         if run_as_admin():
             sys.exit(0)
+        alert("无法获取管理员权限。\n\n"
+              "本工具需要管理员权限才能修改 WARP 隧道规则。\n"
+              "请右键本程序 →「以管理员身份运行」。")
         pause()
         sys.exit(1)
 
