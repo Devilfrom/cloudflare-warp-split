@@ -34,6 +34,7 @@ import shutil
 import socket
 import select
 import hashlib
+import random
 import threading
 import subprocess
 from socketserver import ThreadingUDPServer, BaseRequestHandler
@@ -263,6 +264,11 @@ metrics = {
 }
 metrics_history = []  # 近 60 个采样点 {t,cn,intl,spd}
 metrics_lock = threading.Lock()
+
+# 网络体检结果缓存(30s): 体检要跑 5-12s, 防止用户连点或前端重试导致
+# 重复发起 tracert/DoH 探测。
+audit_cache = {"data": None, "ts": 0}
+audit_lock = threading.Lock()
 
 # ====================== 日志 ======================
 # 按天轮转 + 自动清理: 守护线程长年运行会持续写日志, 单文件会无限增长,
@@ -868,6 +874,335 @@ def check_dns():
         res["msg"] = ("系统与 DoH 的解析结果均为境外地址。可能是该域名使用境外 CDN, "
                       "也可能是 DoH 出口在境外(Cloudflare DoH 常返回 103.235.x.x 香港节点)。")
     return res
+
+
+# ====================== IP / DNS 污染检测 ======================
+# GFW 伪造 DNS 响应时下发的"黑洞 IP"——历次实测与公开研究整理的常见网段
+# (The Great DNS Wall of China / gfw.report 等)。命中这些网段, 说明拿到的
+# 不是目标网站的真实地址, 而是被塞过来的假 IP(连过去要么超时要么被嗅探)。
+# 注意: 这是启发式佐证, 主判据是"系统 / DoH / 上游"三通道分歧。
+POISON_NETS = [ipaddress.ip_network(n) for n in [
+    "4.36.66.178/32", "8.7.198.45/32", "14.102.249.18/32",
+    "31.13.92.0/24",                       # 拿 Facebook 的 IP 冒充 Google 等
+    "37.61.224.0/20",                      # 37.61.229.25 等
+    "46.82.170.0/23", "46.82.174.0/24",
+    "59.24.3.173/32", "64.33.88.161/32", "64.33.99.47/32",
+    "65.49.2.10/32", "67.19.159.0/24", "72.14.205.99/32",
+    "78.16.49.0/24", "93.46.8.0/24",
+    "111.175.220.0/24", "111.175.221.0/24",
+    "159.106.121.0/24", "203.161.9.0/24",
+    "211.98.70.0/24", "211.98.71.0/24",
+    "216.234.179.186/32", "243.185.187.0/24",
+    "120.203.249.18/32", "1.202.3.198/32",
+    "106.186.123.146/32", "174.142.79.0/24",
+]]
+
+
+def is_poison_ip(ip):
+    """是否是已知的 DNS 伪造响应 IP(黑洞地址)。"""
+    if not ip:
+        return False
+    try:
+        a = ipaddress.ip_address(ip)
+    except Exception:
+        return False
+    return any(a in n for n in POISON_NETS)
+
+
+def _parse_dns_pkt(data):
+    """解析 DNS 响应报文, 返回 (A记录IP列表, TTL列表, rcode)。只认 A 记录。"""
+    import struct as _s
+    ips, ttls = [], []
+    rcode = -1
+    try:
+        qd, an = _s.unpack(">HH", data[4:8])
+        rcode = data[3] & 0x0F
+        off = 12
+        for _ in range(qd):                    # 跳过 question 区
+            while off < len(data) and data[off] != 0:
+                off += 1 + data[off]
+            off += 5
+        for _ in range(an):                    # 逐条解析 answer
+            if off >= len(data):
+                break
+            if data[off] >= 0xC0:              # 域名压缩指针
+                off += 2
+            else:
+                while off < len(data) and data[off] != 0:
+                    off += 1 + data[off]
+                off += 1
+            if off + 10 > len(data):
+                break
+            rtype, _cls, ttl, rdlen = _s.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            rdata = data[off:off + rdlen]
+            off += rdlen
+            if rtype == 1 and rdlen == 4:      # 1 = A
+                ips.append(socket.inet_ntoa(rdata))
+                ttls.append(ttl)
+    except Exception:
+        pass
+    return ips, ttls, rcode
+
+
+def raw_dns_query(server, hostname, timeout=3.0):
+    """直向 server:53 发 UDP DNS 查询 —— 绕过系统解析器, 也绕过 WARP DNS。
+
+    这是污染检测的关键一招: WARP 连着的时候系统解析走 127.0.2.2(永远干净),
+    只有直查路由器/运营商 DNS 才能看到真实网络有没有被做手脚。
+    返回 (ips, ttls, rcode, 耗时ms); 失败时 ips 为空、rcode=-1。
+    """
+    import struct as _s
+    try:
+        qname = b"".join(bytes([len(p)]) + p.encode("ascii", "ignore")
+                         for p in hostname.split(".") if p) + b"\x00"
+    except Exception:
+        return [], [], -1, -1
+    pkt = (_s.pack(">HHHHHH", random.randint(0, 0xFFFF), 0x0100, 1, 0, 0, 0)
+           + qname + _s.pack(">HH", 1, 1))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    t0 = time.time()
+    try:
+        sock.sendto(pkt, (server, 53))
+        data, _addr = sock.recvfrom(4096)
+    except Exception:
+        return [], [], -1, -1
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    ms = int((time.time() - t0) * 1000)
+    ips, ttls, rcode = _parse_dns_pkt(data)
+    return ips, ttls, rcode, ms
+
+
+def resolve_a_limited(hostname, timeout=2.5):
+    """限定时间内用系统解析器拿 A 记录列表(排序去重)。
+
+    getaddrinfo 不受 socket 超时控制(DNS 卡死时能挂几十秒), 所以丢进线程
+    用 join 限时 —— 与 net_ok() 同一套路, 超时返回 []。
+    """
+    box = {}
+
+    def f():
+        try:
+            infos = socket.getaddrinfo(hostname, 443, socket.AF_INET,
+                                       proto=socket.IPPROTO_TCP)
+            box["ips"] = sorted({i[4][0] for i in infos})
+        except Exception:
+            box["ips"] = []
+
+    t = threading.Thread(target=f, daemon=True)
+    t.start()
+    t.join(timeout)
+    return box.get("ips") or []
+
+
+# 污染检测探测域名: 境外(墙内最常被伪造响应) + 国内对照(理应拿大陆 IP)
+POLLUTION_DOMAINS = [
+    ("www.google.com", "Google"),
+    ("www.youtube.com", "YouTube"),
+    ("www.facebook.com", "Facebook"),
+    ("www.wikipedia.org", "Wikipedia"),
+]
+POLLUTION_CONTROL = [("www.baidu.com", "百度(对照)")]
+
+
+def check_pollution():
+    """多域名 DNS/IP 污染检测(只读, 不改任何配置)。
+
+    三条通道交叉对比, 每个域名都问一遍:
+      系统 —— 跟随网卡 DNS(WARP 连着时就是 WARP DNS, 理应永远干净)
+      DoH  —— cloudflare-dns.com 境外基准(经隧道出境, 无污染)
+      上游 —— 直查路由器/运营商 DNS(绕过 WARP, 看真实网络干不干净)
+
+    判定优先级: 系统命中伪造 IP > 上游命中伪造 IP > 与 DoH 分歧 > 干净。
+    这样即使 WARP 开着(系统永远干净), 也能揭示"上游本来有多脏"。
+    """
+    upstream = get_gateway() or "119.29.29.29"
+    items, stats = [], {"clean": 0, "polluted": 0, "upstream": 0,
+                        "mismatch": 0, "unknown": 0}
+    for dom, label in POLLUTION_DOMAINS + POLLUTION_CONTROL:
+        is_ctl = any(dom == d for d, _ in POLLUTION_CONTROL)
+        sys_ips = resolve_a_limited(dom)
+        doh_ips = doh_resolve(dom, timeout=4.0)
+        up_ips, up_ttls, rcode, up_ms = raw_dns_query(upstream, dom)
+        sys_poison = next((ip for ip in sys_ips if is_poison_ip(ip)), "")
+        up_poison = next((ip for ip in up_ips if is_poison_ip(ip)), "")
+
+        if is_ctl:
+            # 国内对照域名: 系统能拿到大陆 IP 即正常
+            cn = [ip for ip in sys_ips if is_cn_ip(ip)]
+            if sys_ips and len(cn) == len(sys_ips):
+                status = "clean"
+            elif sys_ips:
+                status = "mismatch"      # 国内域名解析出境外 IP, 可疑
+            else:
+                status = "unknown"
+        elif sys_poison:
+            status = "polluted"          # 系统解析直接被伪造(严重)
+        elif up_poison:
+            status = "upstream"          # 上游命中伪造 IP, 但系统/DoH 干净
+        elif up_ips and doh_ips and not (set(up_ips) & set(doh_ips)):
+            status = "mismatch"          # 上游与干净基准分歧(伪造/劫持)
+        elif doh_ips and sys_ips and not (set(sys_ips) & set(doh_ips)):
+            status = "mismatch"          # 系统与基准分歧
+        elif not up_ips and rcode == 3 and doh_ips:
+            status = "mismatch"          # 上游 NXDOMAIN, DoH 却有结果
+        elif not up_ips and not doh_ips:
+            status = "unknown"           # 上游与 DoH 都没结果, 无法判断
+        else:
+            status = "clean"
+        stats[status] = stats.get(status, 0) + 1
+
+        ttl_txt = ("TTL %ss" % min(up_ttls)) if up_ttls else ""
+        items.append({
+            "domain": dom, "label": label, "status": status,
+            "system": sys_ips, "doh": doh_ips, "upstream": up_ips,
+            "upstream_server": upstream, "up_ms": up_ms, "ttl": ttl_txt,
+            "rcode": rcode, "poison_ip": sys_poison or up_poison,
+        })
+
+    if stats.get("polluted"):
+        verdict, summary = "bad", "系统 DNS 解析被伪造 —— 有域名拿到了假 IP"
+    elif stats.get("upstream") or stats.get("mismatch"):
+        verdict, summary = ("warn",
+                            "上游 DNS 有污染迹象, 但系统解析干净(WARP DNS 正在保护)")
+    elif stats.get("clean") and not stats.get("unknown"):
+        verdict, summary = "clean", "所有探测域名解析一致, 未发现污染"
+    else:
+        verdict, summary = "unknown", "多数域名无法获取基准, 判断依据不足"
+    return {"verdict": verdict, "summary": summary, "items": items,
+            "stats": stats, "upstream": upstream}
+
+
+LINK_TARGETS = [
+    ("www.baidu.com", 443, "国内站点 · 应直连"),
+    ("cloudflare-dns.com", 443, "Cloudflare · 应走 WARP"),
+    ("1.1.1.1", 443, "WARP 任播入口"),
+]
+
+
+def check_links():
+    """TCP 握手探测(只读): 验证国内直连与境外隧道两条路都通, 并量握手耗时。"""
+    items = []
+    for host, port, label in LINK_TARGETS:
+        ips = resolve_a_limited(host, 2.0)
+        ip = ips[0] if ips else host
+        t0 = time.time()
+        ok = False
+        try:
+            s = socket.create_connection((ip, port), timeout=3)
+            ok = True
+            s.close()
+        except Exception:
+            ok = False
+        items.append({"target": "%s:%d" % (host, port), "label": label,
+                      "ip": ip, "ok": ok, "ms": int((time.time() - t0) * 1000)})
+    return items
+
+
+def network_audit():
+    """一键网络体检(只读): 污染检测 + 出口归属 + 链路质量 + 分流链路。
+
+    与「分流自检」互补 —— 自检回答"分流有没有生效", 体检回答"网络干不干净、
+    通不通、有没有被做手脚"。全部只读, 不碰任何配置; tracert/DoH/原始 DNS
+    都是轻量探测。WARP 状态与出口信息直接复用 topology_snapshot 的缓存,
+    不额外起 warp-cli 子进程。
+    """
+    t0 = time.time()
+    groups, score = [], 100
+
+    # ---- 1. DNS/IP 污染检测 ----
+    pol = check_pollution()
+    for it in pol["items"]:
+        if it["status"] == "polluted":
+            score -= 30
+        elif it["status"] in ("upstream", "mismatch"):
+            score -= 8
+    score = max(score, 0)
+    groups.append({"id": "pollution", "name": "DNS / IP 污染检测",
+                   "verdict": pol["verdict"], "summary": pol["summary"],
+                   "items": pol["items"], "upstream": pol["upstream"]})
+
+    # ---- 2. 出口与归属(复用拓扑缓存, 零子进程) ----
+    snap = topology_snapshot()
+    w, e = snap["warp"], snap["engine"]
+    egress = w.get("egress_ip") or ""
+    via_warp = is_cloudflare_ip(egress)
+    items = [
+        {"name": "公网出口 IP", "ok": bool(egress),
+         "detail": (egress or "获取失败") + (" · Cloudflare(WARP)" if via_warp
+                                            else " · 非 Cloudflare")},
+        {"name": "边缘节点 colo", "ok": bool(w.get("colo")),
+         "detail": w.get("colo") or "—"},
+        {"name": "出口归属地", "ok": bool(w.get("loc")),
+         "detail": w.get("loc") or "—"},
+        {"name": "WARP 连接状态", "ok": bool(w.get("connected")),
+         "detail": "已连接" if w.get("connected") else "未连接(体检按当前状态进行)"},
+        {"name": "已注入规则", "ok": (e.get("rules") or 0) > 0,
+         "detail": "%d 条" % (e.get("rules") or 0)},
+    ]
+    if not w.get("connected"):
+        score -= 5                      # 没连 WARP 不算故障, 轻微提示
+    eg_warn = [i for i in items if not i["ok"] and i["name"] != "WARP 连接状态"]
+    groups.append({"id": "egress", "name": "出口与归属",
+                   "verdict": "warn" if eg_warn else "ok", "summary": "",
+                   "items": items})
+
+    # ---- 3. 链路质量 ----
+    links = check_links()
+    fail = 0
+    for it in links:
+        it["status"] = "ok" if it["ok"] else "fail"
+        if not it["ok"]:
+            fail += 1
+            score -= 15
+        elif it["ms"] > 400:            # 握手过慢, 疑似绕路
+            it["status"] = "slow"
+            score -= 5
+    groups.append({"id": "links", "name": "链路质量(TCP 握手)",
+                   "verdict": "bad" if fail == len(links) else
+                              ("warn" if fail or any(i["status"] == "slow" for i in links) else "ok"),
+                   "summary": "%d/%d 可达" % (len(links) - fail, len(links)),
+                   "items": links})
+
+    # ---- 4. 分流链路(WARP 未连接时跳过, 不算故障) ----
+    routes = []
+    if w.get("connected"):
+        cn_hop = first_hop("1.0.1.1")
+        fx_hop = first_hop("8.8.8.8")
+        lan_hop = first_hop("192.168.1.1")
+        cn_ok = bool(cn_hop) and is_private_ip(cn_hop)
+        fx_ok = bool(fx_hop) and is_cloudflare_ip(fx_hop)
+        lan_ok = bool(lan_hop) and is_private_ip(lan_hop)
+        routes = [
+            {"name": "国内 IP 1.0.1.1", "ok": cn_ok,
+             "detail": "首跳 " + (cn_hop or "无") + (" · 本地网关直连" if cn_ok else " · 未直连 ⚠")},
+            {"name": "境外 IP 8.8.8.8", "ok": fx_ok,
+             "detail": "首跳 " + (fx_hop or "无") + (" · 走 WARP 隧道" if fx_ok else " · 未走 WARP ⚠")},
+            {"name": "局域网 192.168.1.1", "ok": lan_ok,
+             "detail": "首跳 " + (lan_hop or "无") + (" · 可达" if lan_ok else " · 不可达 ⚠")},
+        ]
+        for r in routes:
+            if not r["ok"]:
+                score -= 10
+        groups.append({"id": "routes", "name": "分流链路",
+                       "verdict": "ok" if all(r["ok"] for r in routes) else "warn",
+                       "summary": "", "items": routes})
+    else:
+        groups.append({"id": "routes", "name": "分流链路",
+                       "verdict": "skip",
+                       "summary": "WARP 未连接, 跳过(启用分流后可复查)",
+                       "items": []})
+
+    score = max(0, min(100, score))
+    verdict = "healthy" if score >= 90 else ("warn" if score >= 60 else "bad")
+    return {"ts": time.time(), "duration_ms": int((time.time() - t0) * 1000),
+            "score": score, "verdict": verdict, "groups": groups,
+            "pollution": pol}
 
 
 def self_test():
@@ -2026,6 +2361,12 @@ def read_nic_dns(force=False):
                 "((Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 "
                 "-ErrorAction SilentlyContinue | Select-Object -First 1).NextHop)")
         _rc, out = _ps(body, timeout=20)
+        if _rc != 0:
+            # PowerShell 失败(超时/被拦): 绝不能把错误信息当成 DNS 值缓存,
+            # 否则面板会展示一串 Command 报错文本。按空处理, 下次再试。
+            _NIC_DNS_CACHE["ts"] = now
+            _NIC_DNS_CACHE["val"] = []
+            return []
         val = []
         for ln in (out or "").splitlines():
             ln = ln.strip()
@@ -4136,6 +4477,24 @@ class Handler(BaseHTTPRequestHandler):
             save_settings()
             ok, out = register_watchdog(5) if on else unregister_watchdog()
             self._json({"ok": ok, "msg": out})
+        elif p == "/api/audit":
+            # 一键网络体检(只读): 污染检测 + 出口归属 + 链路质量 + 分流链路。
+            # 全程约 5-12s(tracert/DoH/原始DNS探测), 同步返回(ThreadingHTTPServer
+            # 每请求独立线程, 不阻塞面板轮询); 结果缓存 30s 防连点重复探测。
+            try:
+                now = time.time()
+                with audit_lock:
+                    if audit_cache.get("data") and now - audit_cache.get("ts", 0) < 30:
+                        self._json(audit_cache["data"])
+                        return
+                data = network_audit()
+                with audit_lock:
+                    audit_cache["data"] = data
+                    audit_cache["ts"] = now
+                self._json(data)
+            except Exception as e:
+                self._json({"verdict": "ERROR", "msg": str(e),
+                            "groups": [], "score": 0})
         elif p == "/api/refresh":
             threading.Thread(target=refresh_list, daemon=True).start()
             self._json({"ok": True})

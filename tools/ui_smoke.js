@@ -50,10 +50,21 @@ setTimeout(() => {
   const warp = d.querySelector('[data-node="warp"]');
   ok(warp && warp.querySelectorAll("text").length >= 4, "WARP 节点 >=4 行数据");
 
+  // jsdom 的 getComputedStyle 不解析 var(), 新版直接返回字面量,
+  // 所以样式相关断言一律校验原始 CSS 文本, 不做计算样式断言。
+  const css = d.querySelector("style").textContent;
+
+  console.log("== 网络体检 ==");
+  ok(!!$("btnAudit"), "体检按钮存在");
+  ok(!!$("auditCard") && !!$("auditBody"), "体检结果卡片存在(默认隐藏)");
+  ok(d.getElementById("auditCard").classList.contains("hidden"), "体检卡片默认隐藏");
+  ok(/audit-ring/.test(css) && /audit-grp/.test(css), "体检样式类齐全");
+  ok(typeof dom.window.renderAudit === "function" && typeof dom.window.renderPollutionItem === "function",
+     "渲染函数已导出到 window");
+
   console.log("== 样式 ==");
   // 注意: jsdom 的 getComputedStyle 不解析 var(), 新版直接返回字面量,
   // 所以这里校验原始 CSS 文本(变量定义 / 关键声明), 不做计算样式断言。
-  const css = d.querySelector("style").textContent;
   ok(/--bg:\s*#0a0e14/.test(css), "暗色底变量定义");
   ok(/\.card\{[\s\S]*?border-radius:\s*var\(--r\)/.test(css), "卡片圆角 var(--r)");
   ok(/body\{[\s\S]*?radial-gradient/.test(css), "顶部光晕背景");

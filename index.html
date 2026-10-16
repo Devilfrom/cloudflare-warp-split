@@ -255,6 +255,60 @@
   .topo-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
   .topo-chips .chip{font-size:11px}
   .topo-chips .chip b{color:var(--txt)}
+
+  /* ---- 网络体检 ---- */
+  .audit-head{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:6px}
+  .audit-ring{
+    width:76px;height:76px;border-radius:50%;flex:none;position:relative;
+    background:conic-gradient(var(--ring,#2ecc71) calc(var(--p,0)*1%),var(--panel3) 0);
+    transition:background .4s;
+  }
+  .audit-ring::after{
+    content:"";position:absolute;inset:8px;border-radius:50%;background:var(--panel);
+  }
+  .audit-ring .n{
+    position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-size:21px;font-weight:800;z-index:1;
+  }
+  .audit-verdict{display:flex;flex-direction:column;gap:4px;min-width:0}
+  .audit-verdict .v{font-size:17px;font-weight:800}
+  .audit-verdict .s{font-size:12px;color:var(--sub);line-height:1.6}
+  .audit-grp{margin-top:16px;border:1px solid var(--border);border-radius:var(--r2);overflow:hidden}
+  .audit-grp>h3{
+    display:flex;align-items:center;gap:9px;padding:10px 14px;font-size:13px;font-weight:700;
+    background:var(--panel2);border-bottom:1px solid var(--border);
+  }
+  .audit-grp>h3 .sum{font-weight:400;font-size:11.5px;color:var(--sub);margin-left:auto;text-align:right}
+  .audit-grp .body{padding:6px 14px 10px}
+  .audit-st{font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:20px;flex:none;letter-spacing:.3px}
+  .audit-st.ok,.audit-st.clean,.audit-st.healthy{color:var(--green);background:var(--green-soft)}
+  .audit-st.warn,.audit-st.mismatch,.audit-st.upstream,.audit-st.slow{color:var(--amber);background:var(--amber-soft)}
+  .audit-st.bad,.audit-st.polluted,.audit-st.fail{color:var(--red);background:var(--red-soft)}
+  .audit-st.unknown,.audit-st.skip{color:var(--sub);background:var(--panel3)}
+  .audit-item{
+    display:flex;align-items:baseline;gap:10px;padding:7px 0;font-size:12.5px;
+    border-bottom:1px dashed var(--border);
+  }
+  .audit-item:last-child{border-bottom:none}
+  .audit-item .nm{flex:none;min-width:132px;color:var(--txt)}
+  .audit-item .dt{color:var(--sub);font-size:11.5px;line-height:1.7;word-break:break-all}
+  .audit-item .dt .ip{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px}
+  .audit-item .dt .bad{color:var(--red)}
+  .audit-item .dt .good{color:var(--green)}
+  .audit-col{display:grid;grid-template-columns:132px 1fr;gap:10px;padding:7px 0;
+    border-bottom:1px dashed var(--border);font-size:12px;align-items:baseline}
+  .audit-col:last-child{border-bottom:none}
+  .audit-col .nm{font-weight:600}
+  .audit-col .nm small{display:block;font-weight:400;font-size:10.5px;color:var(--sub2);margin-top:1px}
+  .audit-cols{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 14px}
+  .audit-cols .c{font-size:10.5px;color:var(--sub2);margin-bottom:1px}
+  .audit-cols .c b{display:block;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+    font-size:11px;font-weight:500;color:var(--txt);word-break:break-all;line-height:1.5}
+  .audit-cols .c.bad b{color:var(--red)}
+  @media(max-width:640px){
+    .audit-item,.audit-col{grid-template-columns:1fr}
+    .audit-item .nm,.audit-col .nm{min-width:0}
+  }
 </style>
 </head>
 <body>
@@ -431,6 +485,7 @@
       <h2>快速操作</h2>
       <div class="btns">
         <button id="btnSelfTest">分流自检</button>
+        <button id="btnAudit">网络体检</button>
         <button id="btnFixIpv6">修复 IPv6</button>
         <button id="btnUpdateList">更新中国IP列表</button>
         <button id="btnDisable">停用分流</button>
@@ -496,6 +551,11 @@
   </div>
 
   <div class="grid">
+    <div class="card full hidden" id="auditCard">
+      <h2>网络体检结果 <span class="hint">（IP/DNS 污染检测 · 出口归属 · 链路质量 · 分流链路）</span></h2>
+      <div id="auditBody"></div>
+    </div>
+
     <div class="card full hidden" id="selfTestCard">
       <h2>分流自检结果 <span class="hint">（验证国际是否走 WARP、国内是否直连）</span></h2>
       <div id="selfTestBody"></div>
@@ -911,6 +971,84 @@ function renderSelfTest(d){
       return '<div style="font-size:11.5px;color:'+c+';margin-top:8px;line-height:1.7">'+dns.msg+
         (dns.system&&dns.system.length?'<br>系统: '+dns.system.join(", "):"")+
         (dns.doh&&dns.doh.length?'<br>DoH: '+dns.doh.join(", "):"")+'</div>'; })();
+}
+
+// ---- 网络体检 ----
+$("btnAudit").addEventListener("click",function(){
+  this.disabled=true; const t=this.textContent; this.textContent="体检中(约5-12秒)...";
+  fetch("/api/audit",{method:"POST"}).then(r=>r.json()).then(d=>{
+    renderAudit(d);
+    toast("体检完成："+({healthy:"健康",warn:"需关注",bad:"有风险"})[d.verdict]||d.verdict);
+  }).catch(()=>toast("体检失败")).finally(()=>{ this.disabled=false; this.textContent=t; });
+});
+var AUDIT_ST={
+  healthy:{t:"健康",c:"var(--green)"}, warn:{t:"需关注",c:"var(--amber)"}, bad:{t:"有风险",c:"var(--red)"},
+  ok:{t:"正常",c:"var(--green)"}, clean:{t:"干净",c:"var(--green)"},
+  unknown:{t:"未检测",c:"var(--sub)"}, skip:{t:"跳过",c:"var(--sub)"},
+  polluted:{t:"已污染",c:"var(--red)"}, upstream:{t:"上游污染",c:"var(--amber)"},
+  mismatch:{t:"疑似污染",c:"var(--amber)"}, slow:{t:"偏慢",c:"var(--amber)"}, fail:{t:"不可达",c:"var(--red)"}
+};
+function auditST(s){ return AUDIT_ST[s]||{t:String(s||"未知"),c:"var(--sub)"}; }
+function auditEsc(s){ return String(s==null?"":s).replace(/[&<>"]/g,
+  function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
+
+function renderPollutionItem(it){
+  const sv=auditST(it.status);
+  const sysTxt=(it.system||[]).join(", ")||"—";
+  const dohTxt=(it.doh||[]).join(", ")||"—";
+  const upTxt=(it.upstream||[]).join(", ")||"—";
+  const upBad=(it.status==="mismatch"||it.status==="upstream"||it.status==="polluted");
+  const rcTxt=it.rcode===3?" · NXDOMAIN":(it.rcode===2?" · SERVFAIL":"");
+  return '<div class="audit-col">'+
+    '<div class="nm">'+auditEsc(it.label||it.domain)+'<small>'+auditEsc(it.domain)+'</small></div>'+
+    '<div><div class="audit-cols">'+
+      '<div class="c">系统解析<b'+(it.status==="polluted"?' class="bad"':"")+'>'+auditEsc(sysTxt)+'</b></div>'+
+      '<div class="c">DoH 基准<b>'+auditEsc(dohTxt)+'</b></div>'+
+      '<div class="c'+(upBad?" bad":"")+'">上游直查<b>'+auditEsc(upTxt)+
+        (it.ttl?" · "+auditEsc(it.ttl):"")+rcTxt+'</b></div>'+
+    '</div><div style="margin-top:5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">'+
+      '<span class="audit-st '+auditEsc(it.status)+'">'+auditEsc(sv.t)+'</span>'+
+      (it.poison_ip?'<span style="font-size:11px;color:var(--red)">命中已知伪造 IP '+auditEsc(it.poison_ip)+'</span>':'')+
+    '</div></div></div>';
+}
+function renderAudit(d){
+  const card=$("auditCard"); card.classList.remove("hidden");
+  if(d.verdict==="ERROR"||!d.groups){
+    $("auditBody").innerHTML='<div class="audit-item"><span class="audit-st bad">失败</span>'+
+      '<span class="dt">'+auditEsc(d.msg||"未知错误")+'</span></div>';
+    return;
+  }
+  const v=auditST(d.verdict);
+  const sc=(d.score==null?0:d.score);
+  let h='<div class="audit-head">'+
+    '<div class="audit-ring" style="--p:'+sc+';--ring:'+v.c+'"><div class="n" style="color:'+v.c+'">'+sc+'</div></div>'+
+    '<div class="audit-verdict"><span class="v" style="color:'+v.c+'">'+auditEsc(v.t)+'</span>'+
+    '<span class="s">体检耗时 '+(d.duration_ms||0)+' ms · 全部只读检测，未改动任何网络配置</span></div></div>';
+  (d.groups||[]).forEach(function(g){
+    const gv=auditST(g.verdict||"unknown");
+    h+='<div class="audit-grp"><h3>'+auditEsc(g.name)+
+       '<span class="audit-st '+auditEsc(g.verdict||"")+'">'+auditEsc(gv.t)+'</span>'+
+       (g.summary?'<span class="sum">'+auditEsc(g.summary)+'</span>':'')+'</h3><div class="body">';
+    (g.items||[]).forEach(function(it){
+      if(g.id==="pollution"){ h+=renderPollutionItem(it); return; }
+      const st=it.status||(it.ok===true?"ok":"fail");
+      const sv=auditST(st);
+      const nm=auditEsc(it.name||it.target||"");
+      const dt=auditEsc(it.detail||"")+((g.id==="links"&&it.ms!=null)?" · "+it.ms+" ms":"");
+      h+='<div class="audit-item"><span class="audit-st '+st+'">'+auditEsc(sv.t)+'</span>'+
+         '<span class="nm">'+nm+'</span><span class="dt">'+dt+'</span></div>';
+    });
+    h+='</div></div>';
+  });
+  const pol=d.pollution||{};
+  if(pol.upstream){
+    h+='<div style="margin-top:12px;font-size:11.5px;color:var(--sub);line-height:1.8">'+
+      '检测方式：每个域名同时问三条通道 —— <b style="color:var(--txt)">系统解析</b>（跟随网卡 DNS，WARP 连着时即 WARP DNS）、'+
+      '<b style="color:var(--txt)">DoH 基准</b>（cloudflare-dns.com，经隧道出境）、'+
+      '<b style="color:var(--txt)">上游直查</b>（'+auditEsc(pol.upstream)+':53 原始 UDP 查询，绕过 WARP 看真实网络）。'+
+      '任一通道与干净基准分歧，或命中已知伪造 IP 网段（如 31.13.92.0/24），即标记为疑似污染。</div>';
+  }
+  $("auditBody").innerHTML=h;
 }
 
 // ---- 分路切换 ----
