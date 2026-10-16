@@ -1,9 +1,11 @@
 <!DOCTYPE html>
+<!-- warp-split-res v1.4.1  (面板资源版本标记, ensure_data_files() 据此自动更新 exe 旁的旧副本, 勿删) -->
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cloudflare WARP 智能分流控制台</title>
+<script>window.__PANEL_VER__="1.4.1";</script>
 <style>
   :root{
     --bg:#0a0e14; --panel:#111823; --panel2:#161f2d; --panel3:#1c2634;
@@ -309,9 +311,20 @@
     .audit-item,.audit-col{grid-template-columns:1fr}
     .audit-item .nm,.audit-col .nm{min-width:0}
   }
+  .panel-update-bar{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:99;
+    display:flex;align-items:center;gap:12px;padding:10px 16px;border-radius:12px;
+    background:var(--accent);color:#fff;font-size:13px;font-weight:600;
+    box-shadow:0 8px 28px rgba(0,0,0,.35)}
+  .panel-update-bar button{background:rgba(255,255,255,.22);border:0;color:#fff;
+    padding:5px 14px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600}
+  .panel-update-bar button:hover{background:rgba(255,255,255,.34)}
 </style>
 </head>
 <body>
+<div id="panelUpdateBar" class="panel-update-bar hidden">
+  <span>检测到新版本面板</span>
+  <button onclick="location.reload()">立即刷新</button>
+</div>
 <div class="wrap">
   <header>
     <div class="logo">W</div>
@@ -767,7 +780,20 @@ function setToggle(id, on){
 function loadStatus(){
   fetch("/api/status").then(r=>r.json()).then(st=>{
     connFails=0; hideBanner(); setStatus(st);
+    checkPanelVer(st.panel_ver);
   }).catch(()=>{ connFails++; if(connFails>=2) showBanner(); });
+}
+// 磁盘上的面板比当前打开的页面新(换了 exe / 面板被自动更新过)时,
+// 浏览器标签页不会自己刷新 —— 这里提示用户并兜底自动刷新。
+// 解决"重启了程序但面板看着没更新"的体感问题。
+var _verWarned=false;
+function checkPanelVer(v){
+  if(!v || v===window.__PANEL_VER__ || _verWarned) return;
+  _verWarned=true;
+  var bar=$("panelUpdateBar"); if(!bar) return;
+  bar.querySelector("span").textContent="检测到新版本面板 v"+v+"（当前页面 v"+window.__PANEL_VER__+"），刷新后生效";
+  bar.classList.remove("hidden");
+  setTimeout(function(){ if(!document.hidden) location.reload(); }, 60000);
 }
 function loadLog(){
   fetch("/api/log").then(r=>r.json()).then(d=>{

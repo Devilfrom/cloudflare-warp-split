@@ -84,6 +84,11 @@ from concurrent.futures import ThreadPoolExecutor
 IS_FROZEN = getattr(sys, "frozen", False)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 面板资源版本(与 CHANGELOG / Release 同步, 发新版时改这里)。
+# index.html 头部也带同名标记, ensure_data_files() 靠它判断要不要
+# 自动更新 exe 旁边的旧面板副本。
+PANEL_VERSION = "1.4.1"
+
 if IS_FROZEN:
     RES_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     APP_DIR = os.path.dirname(sys.executable)
@@ -119,6 +124,20 @@ def port_in_use(port, host="127.0.0.1", timeout=0.6):
             pass
 
 
+def _exe_fingerprint():
+    """当前 exe 的构建指纹(mtime+size)。
+
+    用于识别"端口那头的实例是不是这个 exe 启动的":
+    换了新版本 exe 但旧进程还在跑时, 双击新 exe 走单实例分支只会打开
+    旧实例的控制台(经典陷阱), 有了指纹就能检测出来并提示用户。
+    """
+    try:
+        st = os.stat(sys.executable)
+        return "%d:%d" % (int(st.st_mtime), st.st_size)
+    except Exception:
+        return ""
+
+
 def pause(msg="按回车退出..."):
     """打包为窗口模式(--windowed)时没有控制台，input() 会抛异常。"""
     try:
@@ -145,10 +164,18 @@ def alert(msg, title="Cloudflare WARP 分流控制台"):
 
 
 def ensure_data_files():
-    """打包模式下，把内置资源首次复制到 exe 同级目录，保证可持久化。"""
+    """打包模式下，把内置资源首次复制到 exe 同级目录，保证可持久化。
+
+    index.html(面板)特殊处理 —— 做**版本比对自动更新**:
+      只复制"不存在"的副本会导致换新 exe 后面板永远不更新(exe 内置新版,
+      旁边旧文件原封不动, 面板看起来"没升级")。现在比对版本标记:
+      旧版/无标记 -> 备份旧文件为 index.user-<ver>.html 后覆盖;
+      已是同版本或更新 -> 不动(尊重用户本地版本)。
+    china_cidr 等是数据文件(用户可能刷新过), 保持"不存在才复制"。
+    """
     if not IS_FROZEN:
         return
-    for name in ("index.html", "china_cidr.txt", "china_cidr_lite.txt"):
+    for name in ("china_cidr.txt", "china_cidr_lite.txt"):
         dst = os.path.join(APP_DIR, name)
         src = os.path.join(RES_DIR, name)
         if not os.path.isfile(dst) and os.path.isfile(src):
@@ -156,6 +183,67 @@ def ensure_data_files():
                 shutil.copy2(src, dst)
             except Exception:
                 pass
+    _update_panel()
+
+
+def _ver_tuple(s):
+    """'1.10.0' -> (1,10,0); 解析失败返回 (0,0,0)。"""
+    try:
+        parts = [int(x) for x in re.findall(r"\d+", s or "")[:3]]
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
+def _panel_ver(path):
+    """读取面板文件头部的版本标记 <!-- warp-split-res vX.Y.Z -->。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(2048).decode("utf-8", "ignore")
+        m = re.search(r"warp-split-res\s+v([\d.]+)", head)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+_PANEL_VER_CACHE = {"ver": None, "ts": 0.0}
+
+
+def panel_version():
+    """当前生效的面板版本(asset_path 指向的那份), 5s 缓存。"""
+    now = time.time()
+    if now - _PANEL_VER_CACHE["ts"] < 5:
+        return _PANEL_VER_CACHE["ver"]
+    ver = _panel_ver(asset_path("index.html")) or PANEL_VERSION
+    _PANEL_VER_CACHE["ver"] = ver
+    _PANEL_VER_CACHE["ts"] = now
+    return ver
+
+
+def _update_panel():
+    """面板自动更新: APP_DIR 副本版本低于内置版本时, 备份旧版并覆盖。"""
+    src = os.path.join(RES_DIR, "index.html")
+    dst = os.path.join(APP_DIR, "index.html")
+    if not os.path.isfile(src):
+        return
+    built_ver = _panel_ver(src) or PANEL_VERSION
+    cur_ver = _panel_ver(dst) if os.path.isfile(dst) else None
+    if cur_ver and _ver_tuple(cur_ver) >= _ver_tuple(built_ver):
+        return                                   # 已是同版本或更新, 不动
+    if os.path.isfile(dst):
+        # 备份用户当前版本(可能是自己改过的), 只保留最近一份
+        try:
+            bak = os.path.join(APP_DIR, "index.user-%s.html" % (cur_ver or "old"))
+            shutil.copy2(dst, bak)
+        except Exception:
+            pass
+    try:
+        shutil.copy2(src, dst)
+        log("面板已自动更新: %s -> %s" % (cur_ver or "无", built_ver))
+    except Exception as e:
+        log("面板更新失败: %s" % e)
 
 
 WARP_CLI_CANDIDATES = [
@@ -635,7 +723,10 @@ def save_state():
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({"enabled": state["enabled"],
-                       "route_active": state.get("route_active")},
+                       "route_active": state.get("route_active"),
+                       # 运行实例的构建指纹: 供"双击新 exe 却发现端口被占"时
+                       # 判断那头是不是旧实例(见 main() 单实例分支)
+                       "proc_build": _exe_fingerprint()},
                       f, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -3966,6 +4057,10 @@ def get_status():
             "route_mode": settings.get("route_mode", "tun"),
             "route_active": state.get("route_active"),
             "bridge_up": state.get("bridge_up", False),
+            # 面板资源版本: 前端轮询时比对, 发现磁盘上的面板比当前打开的
+            # 页面新(换了 exe / 面板自动更新过)就提示刷新, 解决"重启了
+            # 但浏览器标签页不刷新, 看着像没更新"的体感问题。
+            "panel_ver": panel_version(),
             "bridge_port": int(settings.get("bridge_port", 7890)),
             "proxy_port": int(settings.get("proxy_port", 40000)),
             "system_proxy": settings.get("system_proxy", False),
@@ -4617,6 +4712,9 @@ def main():
     ensure_data_files()
     load_settings()
     load_state()
+    # 落一次构建指纹: 之后任何人(包括下次双击的自己)都能从 state.json
+    # 看出"端口那头的实例是不是这个 exe 启的"。
+    save_state()
 
     # 一次性巡检模式: 计划任务每 5 分钟拉起一次, 不启服务、不出界面。
     # 必须在单实例检测之前处理 —— 否则主程序在跑时巡检会被端口占用分支
@@ -4632,6 +4730,23 @@ def main():
     # 抢同一端口会让页面连不上, 或连到已卡死的旧实例上。
     if port_in_use(PORT):
         log(f"端口 {PORT} 已有实例在运行, 直接打开控制台")
+        # 检测运行中的实例是不是"另一个 exe"启的(经典陷阱: 换了新版 exe,
+        # 旧版进程还在后台跑, 双击新 exe 只会打开旧实例的控制台, 用户会
+        # 以为"重启了却没更新")。指纹对得上 = 同版本, 静默打开即可。
+        try:
+            my_fp = _exe_fingerprint()
+            run_fp = None
+            if os.path.isfile(STATE_FILE):
+                with open(STATE_FILE, encoding="utf-8") as f:
+                    run_fp = json.load(f).get("proc_build")
+            if my_fp and run_fp != my_fp:
+                log("运行中的实例构建指纹与当前 exe 不同(疑似旧实例未退出)", logging.WARNING)
+                alert("检测到已有实例在运行, 但它可能不是当前这个 exe 启动的。\n\n"
+                      "常见原因: 你更新了新版本的 exe, 但旧版本进程还在后台运行。"
+                      "此时双击新 exe 只会打开旧实例的控制台, 新功能不会生效。\n\n"
+                      "解决办法: 右键托盘图标 →「退出」, 然后再双击本程序。")
+        except Exception:
+            pass
         try:
             webbrowser.open(url)
         except Exception:

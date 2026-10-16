@@ -62,6 +62,21 @@ setTimeout(() => {
   ok(typeof dom.window.renderAudit === "function" && typeof dom.window.renderPollutionItem === "function",
      "渲染函数已导出到 window");
 
+  console.log("== 面板版本自动刷新 ==");
+  ok(!!$("panelUpdateBar"), "新版本提示条存在(默认隐藏)");
+  ok(d.getElementById("panelUpdateBar").classList.contains("hidden"), "提示条默认隐藏");
+  ok(/panel-update-bar/.test(css), "提示条样式齐全");
+  ok(typeof dom.window.checkPanelVer === "function", "checkPanelVer 函数已导出");
+  ok(typeof dom.window.__PANEL_VER__ === "string" && /^\d+\.\d+\.\d+$/.test(dom.window.__PANEL_VER__),
+     "__PANEL_VER__ 常量: " + dom.window.__PANEL_VER__);
+  ok(/warp-split-res v\d+\.\d+\.\d+/.test(html), "HTML 头部带资源版本标记");
+  // 版本一致 -> 不提示; 版本更新 -> 显示提示条
+  dom.window.checkPanelVer(dom.window.__PANEL_VER__);
+  ok(d.getElementById("panelUpdateBar").classList.contains("hidden"), "版本一致时不弹提示");
+  dom.window.checkPanelVer("9.9.9");
+  ok(!d.getElementById("panelUpdateBar").classList.contains("hidden"), "版本过旧时弹出提示条");
+  ok(/9\.9\.9/.test(d.getElementById("panelUpdateBar").textContent), "提示条含新版本号");
+
   console.log("== 样式 ==");
   // 注意: jsdom 的 getComputedStyle 不解析 var(), 新版直接返回字面量,
   // 所以这里校验原始 CSS 文本(变量定义 / 关键声明), 不做计算样式断言。
