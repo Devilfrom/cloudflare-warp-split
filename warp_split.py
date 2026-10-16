@@ -87,7 +87,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 面板资源版本(与 CHANGELOG / Release 同步, 发新版时改这里)。
 # index.html 头部也带同名标记, ensure_data_files() 靠它判断要不要
 # 自动更新 exe 旁边的旧面板副本。
-PANEL_VERSION = "1.4.1"
+PANEL_VERSION = "1.4.2"
 
 if IS_FROZEN:
     RES_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
@@ -2437,6 +2437,11 @@ def read_nic_dns(force=False):
 
     带 20 秒缓存 —— 控制台每 1.5 秒就会拉一次 /api/status, 而每次真读都要
     起一个 PowerShell 进程(实测 1-2 秒), 不缓存等于持续 fork 进程。
+
+    历史教训(重大): 曾经为了"一次 PS 顺带取网关"把 Get-NetRoute 耦合进来,
+    而 Get-NetRoute 在这台机器上每次必挂满 timeout —— read_nic_dns 卡 20s,
+    又因为它在 /api/status 里是持着 state_lock 调的, 导致前端 1.5s 轮询全部
+    堆积、面板数据全「—」。**只查 DNS, 别的一概不碰**; 网关走 get_gateway()。
     """
     if not _IS_WIN:
         return []
@@ -2444,14 +2449,10 @@ def read_nic_dns(force=False):
     if not force and now - _NIC_DNS_CACHE["ts"] < _NIC_DNS_TTL:
         return _NIC_DNS_CACHE["val"]
     try:
-        # 同一次 PowerShell 调用里顺手取默认网关 —— 出口可视化要用, 不额外起进程。
         body = ("Get-DnsClientServerAddress -AddressFamily IPv4 | "
                 "Where-Object { $_.ServerAddresses.Count -gt 0 } | "
-                "ForEach-Object { $_.ServerAddresses -join ',' }; "
-                "'GATEWAY:' + "
-                "((Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 "
-                "-ErrorAction SilentlyContinue | Select-Object -First 1).NextHop)")
-        _rc, out = _ps(body, timeout=20)
+                "ForEach-Object { $_.ServerAddresses -join ',' }")
+        _rc, out = _ps(body, timeout=8)
         if _rc != 0:
             # PowerShell 失败(超时/被拦): 绝不能把错误信息当成 DNS 值缓存,
             # 否则面板会展示一串 Command 报错文本。按空处理, 下次再试。
@@ -2461,14 +2462,7 @@ def read_nic_dns(force=False):
         val = []
         for ln in (out or "").splitlines():
             ln = ln.strip()
-            if not ln:
-                continue
-            if ln.upper().startswith("GATEWAY:"):
-                gw = ln.split(":", 1)[1].strip()
-                if gw and gw[0].isdigit():
-                    _GATEWAY_CACHE["val"] = gw
-                    _GATEWAY_CACHE["ts"] = now
-            else:
+            if ln:
                 val.append(ln)
     except Exception:
         val = []
@@ -2478,15 +2472,51 @@ def read_nic_dns(force=False):
 
 
 _GATEWAY_CACHE = {"ts": 0.0, "val": ""}
+_GATEWAY_TTL = 60
 
 
 def get_gateway():
-    """默认网关地址(带缓存, 与 read_nic_dns 同源)。出口可视化用。"""
+    """默认网关地址(带 60s 缓存)。出口可视化用。
+
+    用 `netsh interface ipv4 show route`(原生 exe, 不经 PowerShell 管线,
+    实测 0.7s)解析默认路由。**不用 Get-NetRoute** —— 那台机器上它每次必挂
+    满 timeout(见 read_nic_dns 的教训), 曾把 /api/status 拖死 20s。
+
+    解析: 找前缀恰为 0.0.0.0/0 的行, 取跃点数最小的那条的网关列。
+    netsh 在中文系统输出可能是 GBK 也可能 UTF-8, 但网关列是 ASCII,
+    所以解码用 ignore 即可, split 不受影响。
+    """
     if not _IS_WIN:
         return ""
-    if not _GATEWAY_CACHE["val"]:
-        read_nic_dns()
-    return _GATEWAY_CACHE["val"]
+    now = time.time()
+    if _GATEWAY_CACHE["val"] and now - _GATEWAY_CACHE["ts"] < _GATEWAY_TTL:
+        return _GATEWAY_CACHE["val"]
+    gw = ""
+    try:
+        r = _run(["netsh", "interface", "ipv4", "show", "route"],
+                 capture_output=True, timeout=8)
+        out = (r.stdout or b"").decode("utf-8", "ignore")
+        best = None
+        for ln in out.splitlines():
+            f = ln.split()
+            if len(f) < 6 or f[3] != "0.0.0.0/0":
+                continue
+            try:
+                metric = int(f[2])
+            except ValueError:
+                continue
+            cand = f[-1]
+            if not (cand and cand[0].isdigit() and cand.count(".") == 3):
+                continue          # "在链路上"或接口名, 不是 IP
+            if best is None or metric < best[0]:
+                best = (metric, cand)
+        if best:
+            gw = best[1]
+    except Exception:
+        gw = ""
+    _GATEWAY_CACHE["val"] = gw
+    _GATEWAY_CACHE["ts"] = now
+    return gw
 
 
 def apply_dns_fallbacks():
@@ -4014,6 +4044,12 @@ def get_status():
     mode = _cached_mode()
     cli_count = _cached_cli_count()
     egress = get_egress_ip()
+    # 这三个调用可能起 PowerShell / schtasks / warp-cli 子进程(缓存过期时),
+    # 必须放在 state_lock 之外 —— 在锁内卡 20 秒会冻结所有守护线程和
+    # /api/status 轮询(真实事故: Get-NetRoute 挂死把面板打成全「—」)。
+    guard_task = watchdog_enabled() if _IS_WIN else False
+    nic_dns = read_nic_dns() if _IS_WIN else []
+    dns_fallback = _cached_fallback_server()
     with state_lock:
         if state["enabled"] and not connected and "Disconnected" not in out and "Failure" not in out:
             connected = True
@@ -4074,9 +4110,9 @@ def get_status():
             "rescue": state.get("rescue"),
             "net_guard": settings.get("net_guard", True),
             "guard_paused": state.get("guard_paused", False),
-            "guard_task": watchdog_enabled() if _IS_WIN else False,
-            "nic_dns": read_nic_dns() if _IS_WIN else [],
-            "dns_fallback": _cached_fallback_server(),
+            "guard_task": guard_task,
+            "nic_dns": nic_dns,
+            "dns_fallback": dns_fallback,
             "bridge_stats": dict(bridge_stats),
             "latency_cn": metrics["latency_cn"],
             "latency_intl": metrics["latency_intl"],

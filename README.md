@@ -615,6 +615,10 @@ v1.4.1 起有三重保障：① 启动时检测到运行中的是旧实例会弹
   exe 启动时（`ensure_data_files()`）比对 exe 旁副本与内置版本——旧版备份为
   `index.user-<版本>.html` 后自动覆盖，杜绝「换了 exe 面板还是旧的」。
   数据文件（china_cidr 等）仍只做「不存在才复制」，用户刷新过的数据绝不被覆盖。
+- **已知坑（v1.4.2 修复）**：`Get-NetRoute` 在某些机器（WARP 虚拟适配器 +
+  5400+ 条排除规则的路由表）上每次必挂满超时——**读网卡 DNS 千万别和查网关
+  耦合在同一次 PowerShell 调用里**，且持锁期间绝不调可能起子进程的函数。
+  网关查询已改用 `netsh interface ipv4 show route`（原生 exe，0.7s）。
 - **体检接口**：`/api/audit`（POST，用户手动触发，约 5–12s，结果缓存 30s 防连点）。
   纯只读探测：多域名三通道 DNS 对比（系统解析 / DoH / 对上游 DNS 的原始 UDP 查询）、
   TCP 握手、traceroute；WARP 状态与出口信息复用 `topology_snapshot` 的缓存，

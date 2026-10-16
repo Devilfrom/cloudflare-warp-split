@@ -4,6 +4,39 @@
 
 ---
 
+## v1.4.2 — 紧急修复：`/api/status` 卡死（面板数据全「—」）
+
+**事故现象**：v1.4.0 起，重启程序后面板所有数据显示「—」，接口 `/api/status`
+请求 90 秒无响应（其他接口 `/api/log` `/api/metrics` `/api/rules` 全部毫秒级正常）。
+
+**根因（三段接力定位）**：
+1. `Get-NetRoute`（查默认网关用的 PowerShell cmdlet）在这台机器上**每次必挂满
+   超时**（实测 3/3 次都是 20.03s 超时，rc=-1）——疑似与 WARP 虚拟适配器 +
+   5400+ 条排除规则的路由表状态有关，属环境问题，无法在程序侧修 Windows。
+2. 而 v1.3.2 做出口拓扑时，为了"一次 PowerShell 顺带取网关"，把 `Get-NetRoute`
+   耦合进了 `read_nic_dns()`——于是读个网卡 DNS 也要陪挂 20 秒。
+3. 更致命的是 `read_nic_dns()` 当时是在 `get_status()` 里**持着 `state_lock`**
+   调用的——卡 20 秒 = 冻结所有守护线程 + 前端 1.5s 轮询全部堆积在锁上，
+   面板自然全「—」。
+
+**修复（三管齐下）**：
+1. **`read_nic_dns()` 只查 DNS**，与网关彻底解耦（timeout 20s→8s）。
+   实测 20.03s → **1.69s**。
+2. **`get_gateway()` 改用 `netsh interface ipv4 show route`**（原生 exe 不经
+   PowerShell 管线，实测 0.71s，解析跃点数最小的默认路由；中文输出无所谓，
+   网关列是 ASCII）。实测拿到 `192.168.33.1`，缓存 60s。
+3. **`get_status()` 里所有可能起子进程的调用全部移出 `state_lock`**
+   （`watchdog_enabled` / `read_nic_dns` / `_cached_fallback_server` 提前到
+   锁外算好）——锁内只做纯字典读取，从机制上杜绝"一个慢调用冻住全局"。
+
+修复后 `/api/status` 实测：冷缓存 1.26s，全热 **0.17s**。
+
+> 定位手法记录：`tasklist` 排除僵尸进程 → 并发压测排除 warp-cli 排队 →
+> getaddrinfo 限时线程排除 DNS 挂起 → 对 get_status 调用链逐步计时 +
+> 拆分 PowerShell 语句，最终锁定 `Get-NetRoute` 单独挂 20s。
+
+---
+
 ## v1.4.1 — 修复「换新 exe 后面板不更新」
 
 **背景（真实事故）**：v1.4.0 发布后，用户按惯例重启程序，面板却没有任何变化。
