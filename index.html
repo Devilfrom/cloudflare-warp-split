@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<!-- warp-split-res v1.4.4  (面板资源版本标记, ensure_data_files() 据此自动更新 exe 旁的旧副本, 勿删) -->
+<!-- warp-split-res v1.4.5  (面板资源版本标记, ensure_data_files() 据此自动更新 exe 旁的旧副本, 勿删) -->
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cloudflare WARP 智能分流控制台</title>
-<script>window.__PANEL_VER__="1.4.4";</script>
+<script>window.__PANEL_VER__="1.4.5";</script>
 <style>
   :root{
     --bg:#0a0e14; --panel:#111823; --panel2:#161f2d; --panel3:#1c2634;
@@ -791,14 +791,18 @@ function loadStatus(){
 // 磁盘上的面板比当前打开的页面新(换了 exe / 面板被自动更新过)时,
 // 浏览器标签页不会自己刷新 —— 这里提示用户并兜底自动刷新。
 // 解决"重启了程序但面板看着没更新"的体感问题。
+// v1.4.5: 去掉 document.hidden 条件 —— 后台标签页同样需要自愈,
+// 否则挂着的提示条会一直在那里, 用户每次切回该标签页都看到"检测到新版本"。
 var _verWarned=false;
 function checkPanelVer(v){
   if(!v || v===window.__PANEL_VER__ || _verWarned) return;
   _verWarned=true;
   var bar=$("panelUpdateBar"); if(!bar) return;
-  bar.querySelector("span").textContent="检测到新版本面板 v"+v+"（当前页面 v"+window.__PANEL_VER__+"），刷新后生效";
+  bar.querySelector("span").textContent="检测到新版本面板 v"+v+"（当前页面 v"+window.__PANEL_VER__+"），即将自动刷新";
   bar.classList.remove("hidden");
-  setTimeout(function(){ if(!document.hidden) location.reload(); }, 60000);
+  // 5 秒后自动刷新(不等 60s: 用户没在看时刷新无成本, 在看时也够读完提示);
+  // 后台标签页的 reload 一样会执行, 这是让它自愈的关键。
+  setTimeout(function(){ location.reload(); }, 5000);
 }
 function loadLog(){
   fetch("/api/log").then(r=>r.json()).then(d=>{
