@@ -87,7 +87,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 面板资源版本(与 CHANGELOG / Release 同步, 发新版时改这里)。
 # index.html 头部也带同名标记, ensure_data_files() 靠它判断要不要
 # 自动更新 exe 旁边的旧面板副本。
-PANEL_VERSION = "1.4.2"
+PANEL_VERSION = "1.4.3"
 
 if IS_FROZEN:
     RES_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
@@ -136,6 +136,21 @@ def _exe_fingerprint():
         return "%d:%d" % (int(st.st_mtime), st.st_size)
     except Exception:
         return ""
+
+
+def console_url():
+    """打开控制台用的 URL —— 带当前 exe 的构建指纹。
+
+    为什么需要: 更新 exe 后双击启动, 若浏览器里已经有一个控制台标签页
+    (哪怕它是几小时前加载的旧面板), 浏览器只会聚焦那个旧标签页, 不会
+    重新加载页面 —— 而旧版面板代码没有版本自检逻辑, 用户看到的就是
+    "重启了却没更新"(v1.4.1/1.4.2 都没堵住这条, 因为挡的是"打开"这个
+    动作本身)。URL 带上指纹后, 每个 exe 版本对应不同的 URL, 浏览器必然
+    新建标签页并拉取最新面板, 从机制上杜绝"焦点旧标签页"。
+    """
+    base = "http://127.0.0.1:%d/" % PORT
+    fp = _exe_fingerprint()
+    return (base + "?_b=" + fp.replace(":", "-")) if fp else base
 
 
 def pause(msg="按回车退出..."):
@@ -4408,7 +4423,7 @@ class TrayApp:
             return
         self._last_open = now
         try:
-            ok = webbrowser.open(self.url)
+            ok = webbrowser.open(console_url())
             if not ok:
                 log("托盘: 未能自动打开浏览器, 请手动访问 " + self.url, logging.WARNING)
         except Exception as e:
@@ -4784,7 +4799,7 @@ def main():
         except Exception:
             pass
         try:
-            webbrowser.open(url)
+            webbrowser.open(console_url())
         except Exception:
             pass
         sys.exit(0)
@@ -4865,7 +4880,7 @@ def main():
     # 看起来就像「点了没反应」。
     if NO_BROWSER_FLAG not in sys.argv:
         try:
-            threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+            threading.Timer(0.8, lambda: webbrowser.open(console_url())).start()
         except Exception:
             pass
 
