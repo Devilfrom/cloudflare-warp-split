@@ -70,6 +70,11 @@ setTimeout(() => {
   ok(typeof dom.window.__PANEL_VER__ === "string" && /^\d+\.\d+\.\d+$/.test(dom.window.__PANEL_VER__),
      "__PANEL_VER__ 常量: " + dom.window.__PANEL_VER__);
   ok(/warp-split-res v\d+\.\d+\.\d+/.test(html), "HTML 头部带资源版本标记");
+  // 版本徽标: header 里常驻显示, 用户一眼可辨当前页面新旧
+  ok(!!$("verText"), "版本徽标元素存在");
+  ok(/\.verchip/.test(css) && /\.verchip b\{/.test(css), "版本徽标样式齐全");
+  ok($("verText").textContent === "v" + dom.window.__PANEL_VER__,
+     "版本徽标已填充: " + $("verText").textContent);
   // 版本一致 -> 不提示; 版本更新 -> 显示提示条
   dom.window.checkPanelVer(dom.window.__PANEL_VER__);
   ok(d.getElementById("panelUpdateBar").classList.contains("hidden"), "版本一致时不弹提示");

@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<!-- warp-split-res v1.4.3  (面板资源版本标记, ensure_data_files() 据此自动更新 exe 旁的旧副本, 勿删) -->
+<!-- warp-split-res v1.4.4  (面板资源版本标记, ensure_data_files() 据此自动更新 exe 旁的旧副本, 勿删) -->
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cloudflare WARP 智能分流控制台</title>
-<script>window.__PANEL_VER__="1.4.3";</script>
+<script>window.__PANEL_VER__="1.4.4";</script>
 <style>
   :root{
     --bg:#0a0e14; --panel:#111823; --panel2:#161f2d; --panel3:#1c2634;
@@ -67,6 +67,10 @@
     padding:5px 10px;border-radius:999px;white-space:nowrap;
   }
   .chip .d{width:7px;height:7px;border-radius:50%;background:var(--sub2)}
+  /* 面板版本徽标: 让用户一眼看出自己看的是不是旧标签页
+     (历史上多次出现"更新了却没看到新功能", 其实是旧页面没刷新) */
+  .verchip{cursor:help}
+  .verchip b{color:var(--txt);font-weight:650;font-family:ui-monospace,Consolas,monospace}
   .iconbtn{
     background:var(--panel2);border:1px solid var(--border);border-radius:12px;
     width:40px;height:40px;cursor:pointer;color:var(--txt);font-size:17px;
@@ -333,6 +337,7 @@
       <div class="s">国际走 WARP 出口 · 国内直连 · 速率 / 延迟监控 · 网络保障</div>
     </div>
     <div class="spacer"></div>
+    <div class="chip verchip" title="面板资源版本。若这里显示的不是最新版，说明你还在看旧的浏览器标签页 —— 按 Ctrl+F5 刷新本页即可">面板 <b id="verText">—</b></div>
     <div class="chip" id="chipVer"><span class="d"></span>控制台</div>
     <button class="iconbtn" id="btnTheme" title="切换暗 / 亮主题">🌙</button>
   </header>
@@ -1310,6 +1315,8 @@ document.addEventListener("visibilitychange",()=>{
 });
 
 initTheme();
+// 版本徽标: 单源头取 window.__PANEL_VER__, 用户一眼可辨当前页面新旧
+$("verText").textContent = "v" + window.__PANEL_VER__;
 loadStatus(); loadLog(); loadMetrics(); loadRules(); loadAutostart();
 topoInit(); loadTopology();
 setInterval(()=>{loadStatus();loadLog();}, 1500);

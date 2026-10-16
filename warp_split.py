@@ -87,7 +87,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 面板资源版本(与 CHANGELOG / Release 同步, 发新版时改这里)。
 # index.html 头部也带同名标记, ensure_data_files() 靠它判断要不要
 # 自动更新 exe 旁边的旧面板副本。
-PANEL_VERSION = "1.4.3"
+PANEL_VERSION = "1.4.4"
 
 if IS_FROZEN:
     RES_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
@@ -4763,6 +4763,17 @@ def main():
     ensure_data_files()
     load_settings()
     load_state()
+    # 先读"上一个实例"的构建指纹, 再落自己的。顺序至关重要:
+    # save_state() 写的是当前进程的指纹, 若先 save 后读, 单实例分支
+    # 比对的就是"自己 vs 自己", 永远相等, 旧实例提示成了死代码
+    # (v1.4.1 引入该提示时埋下的 bug, 直到 v1.4.4 才被发现)。
+    prev_build = None
+    try:
+        if os.path.isfile(STATE_FILE):
+            with open(STATE_FILE, encoding="utf-8") as f:
+                prev_build = json.load(f).get("proc_build")
+    except Exception:
+        pass
     # 落一次构建指纹: 之后任何人(包括下次双击的自己)都能从 state.json
     # 看出"端口那头的实例是不是这个 exe 启的"。
     save_state()
@@ -4786,11 +4797,9 @@ def main():
         # 以为"重启了却没更新")。指纹对得上 = 同版本, 静默打开即可。
         try:
             my_fp = _exe_fingerprint()
-            run_fp = None
-            if os.path.isfile(STATE_FILE):
-                with open(STATE_FILE, encoding="utf-8") as f:
-                    run_fp = json.load(f).get("proc_build")
-            if my_fp and run_fp != my_fp:
+            # 用 main() 开头读到的 prev_build(保存前的旧值) —— 绝不能
+            # 在这里重读 state.json, 那已经是自己刚写的新指纹了
+            if my_fp and prev_build != my_fp:
                 log("运行中的实例构建指纹与当前 exe 不同(疑似旧实例未退出)", logging.WARNING)
                 alert("检测到已有实例在运行, 但它可能不是当前这个 exe 启动的。\n\n"
                       "常见原因: 你更新了新版本的 exe, 但旧版本进程还在后台运行。"
