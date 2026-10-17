@@ -4,6 +4,37 @@
 
 ---
 
+## v1.5.0 — 新功能批次①：隧道实时状态 + 域名级分流
+
+### 新增：WARP 隧道实时状态卡片
+面板新增「WARP 隧道实时状态」卡片（仅连接时显示，5 秒刷新）：
+隧道延迟 / 丢包率 / 收发流量 / 协议 / 入口端点 / 出口 Colo / TLS 版本 /
+后量子加密 / 上次握手时间。数据源是 `warp-cli tunnel stats`（一条 0.2s 的
+只读命令），后端 3s TTL 缓存，单独走 `/api/tunnel_stats`，不拖慢
+`/api/status` 的 145ms 红线。
+
+### 新增：域名级分流（excluded_hosts）
+IP 规则（中国 CIDR）管不到"国内服务解析到海外 CDN 节点"的情况——节点不在
+CN 段里，流量照样进隧道。域名规则让 daemon 在路由层直接放行这些域名的连接，
+与 IP 规则互补。面板「域名级分流」卡片支持添加/删除/导入 28 个常用国内平台
+预设/清空，每条规则带「已生效/待生效」回查标记。
+
+**实现要点（实测结论，2026-10-17）**：
+- `tunnel host add` 会触发 daemon "Settings Changed" **直接断开**，每条一次
+  断线重连（还可能卡进 happy-eyeballs 循环）→ 禁用逐条 CLI；
+- 域名规则与 IP 规则同走「停服务 → 原子改写 settings.json → 起服务」秒级
+  通道（`excluded_hosts` 条目格式与 `excluded_ips` 相同：
+  `[["example.com", "CLI exclude"]]`），写入后回查 `tunnel host list` 校验；
+- 运行中修改约十几秒生效（期间 WARP 重连一次），未启用时仅保存设置；
+- 一键还原同时清空域名规则；DNS 守卫有 `state.running` 门禁不会误插手。
+
+### 修复：`/api/status` 把 Connecting/Unable 显示成"已连接"
+`get_status()` 的强制置真逻辑只排除了 "Disconnected"/"Failure" 字样，
+daemon 卡在 happy-eyeballs 重连循环时面板照样显示"已连接"，用户完全看不出
+隧道已经死了。现在出现过渡态/失败态字样时一律以 warp-cli 真实输出为准。
+
+---
+
 ## v1.4.5 — 修复「检测到新版本」提示条在后台标签页永不消失
 
 **Bug**：v1.4.1 引入的版本提示条（`checkPanelVer`）设了 60s 兜底自动刷新，

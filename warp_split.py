@@ -87,7 +87,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 面板资源版本(与 CHANGELOG / Release 同步, 发新版时改这里)。
 # index.html 头部也带同名标记, ensure_data_files() 靠它判断要不要
 # 自动更新 exe 旁边的旧面板副本。
-PANEL_VERSION = "1.4.5"
+PANEL_VERSION = "1.5.0"
 
 if IS_FROZEN:
     RES_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
@@ -352,7 +352,25 @@ settings = {
     # ---- 网络保障(底线: 任何时候都要能上网) ----
     "net_guard": True,            # 程序运行时的网络看门狗: 连续探测失败就自动退让
     "net_watchdog": True,         # 系统级兜底任务: 程序没运行时也能兜住 DNS 残留
+    # ---- 域名级分流(excluded_hosts) ----
+    # 为什么单列: IP 规则(中国 CIDR)管不到"国内服务解析到海外 CDN 节点"的
+    # 情况 —— 节点不在 CN 段里, 流量照样进隧道, 慢且绕。域名排除让 daemon
+    # 在路由层直接放行这些域名的连接, 与 IP 规则互补。
+    # 实测结论(2026-10-17): `tunnel host add` 会触发 "Settings Changed"
+    # 直接断开 daemon(每条一次断线, 还可能卡死) -> 一律走停服务直写通道。
+    "direct_hosts": [],           # 需要强制直连的域名列表(用户自管)
 }
+
+# 常用国内平台预设: 这些域名的连接走 WARP 毫无收益(服务本身就在国内),
+# 但它们的 CDN 节点偶尔会落在 CN CIDR 之外, IP 规则漏掉时由域名规则兜底。
+DIRECT_HOST_PRESET = [
+    "baidu.com", "bilibili.com", "qq.com", "taobao.com", "tmall.com",
+    "jd.com", "weibo.com", "zhihu.com", "douyin.com", "ixigua.com",
+    "huya.com", "douyu.com", "youku.com", "iqiyi.com", "sohu.com",
+    "163.com", "sina.com.cn", "aliyun.com", "tencent.com", "wps.cn",
+    "xiaomi.com", "huawei.com", "csdn.net", "douban.com",
+    "xiaohongshu.com", "meituan.com", "ctrip.com", "12306.cn",
+]
 
 # 指标 (内存态, 不持久化)
 metrics = {
@@ -438,6 +456,99 @@ def warp(args, timeout=30):
         return False, "命令超时"
     except Exception as e:
         return False, str(e)
+
+
+# ====================== 隧道实时状态 (warp-cli tunnel stats) ======================
+# 客户端 2026.6.x 的 `tunnel stats` 能报告当前隧道的协议 / 入口 / 延迟 /
+# 丢包 / 收发字节 / TLS 详情 / 出口 colo —— 这是"WARP 现在活好不好"最直接的
+# 依据, 而且是一条 0.2 秒的只读命令。
+#
+# 为什么单独一个接口而不并进 /api/status: /api/status 每 1.5 秒被轮询一次且
+# 有严格的延迟红线(145ms), 而 tunnel stats 要新起一个 warp-cli 进程(约
+# 200ms)。拆成 /api/tunnel_stats + 后端 3 秒缓存, 面板 5 秒轮询一次,
+# 两边都舒服。
+_tunnel_stats_cache = {"ts": 0.0, "data": None}
+_TUNNEL_STATS_TTL = 3.0
+
+
+def _parse_size(s):
+    """'3.1MB' -> 3244032。无法解析返回 None。"""
+    m = re.match(r"^\s*([\d.]+)\s*([KMGT]?B)\s*$", str(s), re.I)
+    if not m:
+        return None
+    mult = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+    try:
+        return int(float(m.group(1)) * mult[m.group(2).upper()])
+    except Exception:
+        return None
+
+
+def get_tunnel_stats(ttl=_TUNNEL_STATS_TTL):
+    """读取并解析 `warp-cli tunnel stats`。带 TTL 缓存, 失败不抛异常。
+
+    返回 dict, ok=True 表示隧道活着且解析出了延迟; 关键字段:
+      protocol / endpoints / handshake_s / sent / received(字节数)
+      latency_ms / loss_pct / tls_version / post_quantum / colo / raw
+    """
+    now = time.time()
+    if _tunnel_stats_cache["data"] and now - _tunnel_stats_cache["ts"] < ttl:
+        return _tunnel_stats_cache["data"]
+    st = {
+        "ok": False, "protocol": "", "endpoints": "", "handshake_s": None,
+        "sent": None, "received": None, "latency_ms": None, "loss_pct": None,
+        "tls_version": "", "post_quantum": False, "colo": "", "raw": "",
+    }
+    try:
+        ok, out = warp(["tunnel", "stats"], timeout=10)
+    except Exception:
+        ok, out = False, ""
+    if ok and out:
+        st["raw"] = out
+        for line in out.splitlines():
+            line = line.strip()
+            low = line.lower()
+            if low.startswith("tunnel protocol:"):
+                st["protocol"] = line.split(":", 1)[1].strip()
+            elif low.startswith("endpoints:"):
+                # "162.159.198.2, ::" —— 只取第一个 IPv4, 隧道实际入口
+                ep = line.split(":", 1)[1].strip()
+                st["endpoints"] = ep.split(",")[0].strip() if ep else ""
+            elif low.startswith("time since last handshake:"):
+                v = line.split(":", 1)[1].strip().rstrip("s")
+                try:
+                    st["handshake_s"] = int(float(v))
+                except Exception:
+                    pass
+            elif low.startswith("sent:"):
+                # 形如 "Sent: 63.2kB; Received: 78.0kB" —— sent 在冒号前、
+                # received 在冒号后, 按冒号切会丢 sent, 必须用正则分别抓。
+                m = re.search(r"sent:\s*([\d.]+\s*[KMGT]?B)", line, re.I)
+                if m:
+                    st["sent"] = _parse_size(m.group(1))
+                m = re.search(r"received:\s*([\d.]+\s*[KMGT]?B)", line, re.I)
+                if m:
+                    st["received"] = _parse_size(m.group(1))
+            elif low.startswith("estimated latency:"):
+                v = line.split(":", 1)[1].strip().lower().replace("ms", "")
+                try:
+                    st["latency_ms"] = round(float(v), 1)
+                except Exception:
+                    pass
+            elif low.startswith("estimated loss:"):
+                v = line.split(":", 1)[1].strip().replace("%", "")
+                try:
+                    st["loss_pct"] = round(float(v), 3)
+                except Exception:
+                    pass
+            elif low.startswith("version:"):
+                st["tls_version"] = line.split(":", 1)[1].strip()
+            elif low.startswith("post-quantum enabled:"):
+                st["post_quantum"] = "true" in low
+            elif low.startswith("colo:"):
+                st["colo"] = line.split(":", 1)[1].strip()
+        st["ok"] = st["latency_ms"] is not None
+    _tunnel_stats_cache.update({"ts": now, "data": st})
+    return st
 
 
 def restart_warp_service():
@@ -527,6 +638,26 @@ def read_conf_excludes():
     return builtin, cli
 
 
+def read_conf_hosts():
+    """返回 (daemon 内置域名条目, CLI 排除的域名列表)。解析失败返回 (None, None)。
+
+    条目格式与 excluded_ips 相同: [["example.com", "CLI exclude"]]。
+    daemon 自己写的条目(非 CLI label)必须原样保留, 和 IP 规则一个道理。
+    """
+    d, err = read_warp_conf()
+    if d is None or not isinstance(d.get("excluded_hosts"), list):
+        return None, None
+    builtin, cli = [], []
+    for e in d["excluded_hosts"]:
+        if not isinstance(e, (list, tuple)) or len(e) < 1:
+            continue
+        if len(e) > 1 and e[1] == CLI_EXCLUDE_LABEL:
+            cli.append(str(e[0]))
+        else:
+            builtin.append(list(e))
+    return builtin, cli
+
+
 def svc_ctl(action, timeout=90):
     """启停 CloudflareWARP 服务。先试 net, 再退回 sc。"""
     verb = "stop" if action in ("stop", "down") else "start"
@@ -551,8 +682,11 @@ def wait_daemon_ready(timeout=40):
     return False
 
 
-def write_excludes_fast(desired, phase_cb=None):
+def write_excludes_fast(desired, hosts=None, phase_cb=None):
     """秒级全量写入排除列表: 停服务 -> 原子改写 settings.json -> 起服务。
+
+    desired = IP 规则列表; hosts = 域名规则列表(可选, None 表示不动
+    excluded_hosts 字段, 保持文件里原有内容)。
 
     成功返回 (True, 说明文字); 失败返回 (False, 原因) 由调用方回退到逐条注入。
     """
@@ -564,8 +698,12 @@ def write_excludes_fast(desired, phase_cb=None):
             return False, f"未找到 WARP 配置文件: {cfg}"
 
         wanted = list(dict.fromkeys(desired))
+        wanted_hosts = None if hosts is None else list(dict.fromkeys(hosts))
         if phase_cb:
-            phase_cb(f"准备写入 {len(wanted)} 条规则...")
+            n = f"{len(wanted)} 条 IP 规则"
+            if wanted_hosts is not None:
+                n += f" + {len(wanted_hosts)} 个域名"
+            phase_cb(f"准备写入 {n}...")
 
         # 1) 先断开, 避免 daemon 在改写瞬间还带着旧规则跑
         warp(["disconnect"], timeout=20)
@@ -585,6 +723,7 @@ def write_excludes_fast(desired, phase_cb=None):
         time.sleep(2)
 
         # 4) 原子改写: 保留 daemon 自己写的其它字段, 只换 excluded_ips
+        #    (以及调用方显式传入的 excluded_hosts)
         try:
             d, err = read_warp_conf()
             if d is None:
@@ -593,6 +732,11 @@ def write_excludes_fast(desired, phase_cb=None):
             if builtin is None:
                 builtin = []
             d["excluded_ips"] = builtin + [[c, CLI_EXCLUDE_LABEL] for c in wanted]
+            if wanted_hosts is not None:
+                hbuiltin, _oldh = read_conf_hosts()
+                if hbuiltin is None:
+                    hbuiltin = []
+                d["excluded_hosts"] = hbuiltin + [[h, CLI_EXCLUDE_LABEL] for h in wanted_hosts]
             tmp = cfg + ".warp_split_tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(d, f, ensure_ascii=False, indent=2)
@@ -608,9 +752,13 @@ def write_excludes_fast(desired, phase_cb=None):
         if not wait_daemon_ready():
             return False, "CloudflareWARP 服务启动后无响应"
 
+        msg = f"已一次性写入 {len(wanted)} 条规则"
+        if wanted_hosts is not None:
+            msg += f" + {len(wanted_hosts)} 个域名"
         log(f"已通过配置直写一次性写入 {len(wanted)} 条排除规则 "
-            f"(保留内置默认 {len(builtin)} 条)")
-        return True, f"已一次性写入 {len(wanted)} 条规则"
+            f"(保留内置默认 {len(builtin)} 条)"
+            + (f", 域名 {len(wanted_hosts)} 个" if wanted_hosts is not None else ""))
+        return True, msg
 
 
 def read_list_file(path):
@@ -3051,6 +3199,20 @@ def enable_split():
             raise RuntimeError("分流规则写入失败: " + msg)
         log("规则就绪 -> " + msg)
 
+        # 域名级分流: 与 IP 规则同一次"断开期"写掉(此时改设置不会触发
+        # Settings Changed 断线, 连上后一并生效)。放在 connect 之前是
+        # 关键 —— `tunnel host add` 在运行中会直接把 daemon 断开。
+        direct_hosts = [normalize_host(h) for h in settings.get("direct_hosts", [])]
+        direct_hosts = [h for h in direct_hosts if h]
+        if direct_hosts:
+            ok_h, msg_h = sync_hosts(direct_hosts, prune=False,
+                                     phase_cb=_set_phase, quiet=True)
+            if ok_h:
+                log("域名规则就绪 -> " + msg_h)
+            else:
+                # 域名规则失败不阻断启用: IP 规则已是主力, 域名是增量兜底
+                log("域名规则写入失败(不影响 IP 分流): " + msg_h, logging.WARNING)
+
         # ---- 在连接之前把 DNS 分流装好 ----
         # 顺序有讲究: `dns fallback add` 属于「设置变更」, WARP 收到会把隧道
         # 以 "Settings Changed" 为由断掉(实测确认)。所以趁现在还断着把后缀
@@ -3233,13 +3395,19 @@ def restore():
         pass
     # 优先用配置直写把 CLI 排除清空 —— 秒级完成, 且保留 daemon 自带的默认
     # 排除(Apple 服务/组播等); 直写不可用时回退到官方 reset。
-    ok, msg = write_excludes_fast([])
+    # hosts=[] 同时清空域名排除(它是同文件里的 excluded_hosts 字段)。
+    ok, msg = write_excludes_fast([], hosts=[])
     if not ok:
         log("配置直写清空失败, 回退 tunnel ip reset: " + msg, logging.WARNING)
         try:
             warp(["tunnel", "ip", "reset"], timeout=30)
+            warp(["tunnel", "host", "reset"], timeout=30)
         except Exception:
             pass
+    # 设置里的域名列表一并清掉, 否则下次启用又会写回去
+    if settings.get("direct_hosts"):
+        settings["direct_hosts"] = []
+        save_settings()
     with state_lock:
         state["enabled"] = False
         state["armed"] = False
@@ -3294,6 +3462,167 @@ def refresh_list():
         log("更新中国IP列表失败: " + str(e), logging.ERROR)
         with state_lock:
             state["error"] = str(e)
+    finally:
+        with state_lock:
+            state["running"] = False
+            state["action"] = None
+
+
+# ====================== 域名级分流 (excluded_hosts) ======================
+# 与 IP 规则的关系: IP 规则回答"哪些网段不进隧道", 域名规则回答"哪些域名
+# 的连接不进隧道"。后者补的是前者的盲区 —— 国内服务的 CDN 节点偶尔落在
+# CN CIDR 之外, 只有域名规则能在路由层拦住。
+#
+# 实现约束(2026-10-17 实测, 违反会踩坑):
+#   1. `tunnel host add/remove` 会让 daemon 以 "Settings Changed" 断开,
+#      每条一次断线重连(实测还可能卡进 happy-eyeballs 循环) -> 禁用逐条 CLI;
+#   2. daemon 在服务启动/连接时从 settings.json 读 excluded_hosts, 条目格式
+#      与 excluded_ips 相同: [["example.com", "CLI exclude"]] -> 复用停服务
+#      直写通道, 一次写完再连;
+#   3. 写入后必须回查 `tunnel host list` 校验, 不轻信"写入成功"。
+
+
+def normalize_host(h):
+    """把用户输入规范成 daemon 接受的域名。非法返回 None。
+
+    接受: example.com / *.example.com / https://Example.com:8080/path?q
+    产出: example.com / *.example.com (小写, 去 scheme/端口/路径/首尾点)
+    逐段校验(比一条大正则可读): 每段 1-63 字符、字母数字连字符、不能以
+    连字符开头结尾; 至少两段; 末段(TLD)必须是 2-63 位字母。
+    """
+    if not h:
+        return None
+    s = str(h).strip().lower()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in s:                       # user@host 形式取 host
+        s = s.rsplit("@", 1)[1]
+    if ":" in s:                       # 去端口(域名场景不需要 IPv6 字面量)
+        s = s.split(":", 1)[0]
+    s = s.strip(".")
+    if not s or len(s) > 253:
+        return None
+    star = s.startswith("*.")
+    body = s[2:] if star else s
+    labels = body.split(".")
+    if len(labels) < 2:
+        return None
+    for lb in labels:
+        if not lb or len(lb) > 63:
+            return None
+        if lb.startswith("-") or lb.endswith("-"):
+            return None
+        if not all(c.isalnum() or c == "-" for c in lb):
+            return None
+    tld = labels[-1]
+    if not tld.isalpha() or len(tld) < 2:
+        return None
+    return s
+
+
+def get_cli_hosts():
+    """daemon 当前生效的 CLI 域名排除集合(回查校验用)。"""
+    ok, out = warp(["tunnel", "host", "list"], timeout=15)
+    res = set()
+    if not ok:
+        return res
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if "(CLI exclude)" in ln:
+            h = ln.split()[0].strip().lower()
+            if h:
+                res.add(h)
+    return res
+
+
+def sync_hosts(desired, prune=False, phase_cb=None, quiet=False):
+    """把 daemon 的域名排除列表同步成 desired。返回 (ok, 说明文字)。
+
+    - 与 sync_excludes 同思路: 差集 + 回查校验;
+    - 域名数量级是个位到几十, 一律走配置直写(逐条 CLI 每条触发一次断线,
+      实测还可能卡死, 禁用);
+    - prune=False 只增不删(启用分流时用); True 时以 desired 为准。
+    """
+    want = list(dict.fromkeys(desired))
+    current = get_cli_hosts()
+    want_set = set(want)
+    to_add = [h for h in want if h not in current]
+    to_del = [h for h in current if h not in want_set] if prune else []
+
+    if not to_add and not to_del:
+        return True, f"域名规则已是最新(daemon 现有 {len(current)} 个), 无需写入"
+
+    # 域名写入必须带上一份完整的 IP 规则 —— write_excludes_fast 是全量写,
+    # 不传 IP 会把 5440 条 IP 规则一起清空。这里取「当前 daemon 实有 ∪ 活动
+    # 列表」——只增不减: 丢一条用户手添的规则会导致对应网段被错灌进隧道,
+    # 而多留一条陈旧规则毫无害处。域名部分才听 prune 的。
+    try:
+        all_ranges = read_active_ranges()
+        if MAX_RANGES > 0:
+            all_ranges = all_ranges[:MAX_RANGES]
+    except Exception:
+        all_ranges = []
+    ip_target = list(dict.fromkeys(list(get_cli_excludes()) + list(all_ranges)))
+
+    if phase_cb:
+        phase_cb(f"正在写入 {len(to_add) + len(to_del)} 个域名变更...")
+    ok, msg = write_excludes_fast(ip_target, hosts=want, phase_cb=phase_cb)
+    if not ok:
+        return False, "域名规则写入失败: " + msg
+
+    actual = get_cli_hosts()
+    missing = [h for h in want if h not in actual]
+    if missing:
+        return False, (f"校验失败: {len(missing)}/{len(want)} 个域名未生效"
+                       f"(首个: {missing[0]})。daemon 可能拒绝了该域名格式。")
+    parts = []
+    if to_add:
+        parts.append(f"新增 {len(to_add)}")
+    if to_del:
+        parts.append(f"移除 {len(to_del)}")
+    return True, f"配置直写: {'/'.join(parts)}, daemon 现有 {len(actual)} 个域名"
+
+
+def apply_hosts_runtime():
+    """运行中修改域名规则后应用: 断开 -> 直写(IP+域名) -> 重连。
+
+    只在分流已启用(TUN)时有意义; 未启用时只改设置, 下次启用自动带上。
+    整线程后台跑, 进度写进 state.progress 供面板显示。
+    """
+    with state_lock:
+        if state["running"]:
+            return False, "有操作正在进行, 请稍候"
+        if not state.get("enabled") or not state.get("armed"):
+            return False, "分流未启用, 域名规则已保存, 启用时自动生效"
+        if settings.get("route_mode", "tun") != "tun":
+            return False, "Proxy 分路不使用域名排除(仅 TUN 全局支持)"
+        state["running"] = True
+        state["action"] = "hosts"
+        state["progress"] = {"total": 0, "done": 0, "phase": "正在应用域名规则..."}
+    log("开始应用域名分流规则...")
+    try:
+        ok, msg = sync_hosts(settings.get("direct_hosts", []), prune=True,
+                             phase_cb=_set_phase)
+        if not ok:
+            raise RuntimeError(msg)
+        log("域名规则就绪 -> " + msg)
+        # 直写通道起服务后 WARP 是断开状态, 必须补一次连接
+        connected, last = connect_warp(update_phase=True)
+        if not connected:
+            raise RuntimeError("域名规则已写入, 但重连失败: " + last[:120])
+        with state_lock:
+            state["progress"] = {"total": 0, "done": 0, "phase": "域名规则已生效"}
+        log("域名分流规则已生效并重连")
+        return True, "域名规则已生效"
+    except Exception as e:
+        log("应用域名规则失败: " + str(e), logging.ERROR)
+        with state_lock:
+            state["error"] = str(e)
+        # 失败兜底: 确认网络还通(直写失败最坏情况是服务没起来)
+        threading.Thread(target=ensure_net_ok,
+                         args=("应用域名规则失败",), da=True).start()
+        return False, str(e)
     finally:
         with state_lock:
             state["running"] = False
@@ -4066,7 +4395,14 @@ def get_status():
     nic_dns = read_nic_dns() if _IS_WIN else []
     dns_fallback = _cached_fallback_server()
     with state_lock:
-        if state["enabled"] and not connected and "Disconnected" not in out and "Failure" not in out:
+        # 强制置真的历史原因: 个别 warp-cli 版本"已连接"的输出不含
+        # "Connected" 字面量, 想以 state.enabled 兜底。但它把
+        # Connecting / Unable 也误判成已连接 —— 实测 daemon 卡在
+        # happy-eyeballs 循环时面板照样显示"已连接", 用户根本看不出
+        # 隧道已经死了(2026-10-17 踩过)。修正: 输出里出现过渡态/
+        # 失败态字样时一律不置真, 以 warp-cli 真实输出为准。
+        if state["enabled"] and not connected and not any(
+                w in out for w in ("Connecting", "Unable", "Disconnected", "Failure")):
             connected = True
         # 在线时长
         if connected:
@@ -4564,6 +4900,25 @@ class Handler(BaseHTTPRequestHandler):
                     "uptime_s": metrics["uptime_s"],
                     "history": list(metrics_history),
                 })
+        elif p == "/api/tunnel_stats":
+            # 隧道实时状态(只读): 协议/入口/延迟/丢包/流量/colo。
+            # 后端带 3s TTL 缓存, 面板 5s 轮询一次, 实际 warp-cli 调用约 1 次/3s。
+            try:
+                self._json(get_tunnel_stats())
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+        elif p == "/api/hosts":
+            # 域名级分流: 设置里的列表 + daemon 实际生效的列表(回查)
+            try:
+                self._json({
+                    "hosts": list(settings.get("direct_hosts", [])),
+                    "daemon_hosts": sorted(get_cli_hosts()),
+                    "applying": bool(state.get("action") == "hosts"),
+                    "enabled": bool(state.get("enabled")),
+                    "preset_count": len(DIRECT_HOST_PRESET),
+                })
+            except Exception as e:
+                self._json({"error": str(e)})
         elif p == "/api/topology":
             # 出口拓扑快照: 纯读缓存, 零子进程零请求, 面板可视化用。
             # 注意不要在这里调任何 warp-cli —— 那是 /api/status 的职责。
@@ -4641,6 +4996,43 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"verdict": "ERROR", "msg": str(e),
                             "groups": [], "score": 0})
+        elif p == "/api/hosts":
+            # 域名级分流增删: 先改设置并落盘, 分流开着就后台应用
+            # (停服务直写 + 重连, 约十几秒); 没开着只存设置, 下次启用自动带上。
+            action = str(payload.get("action") or "").strip()
+            hosts = list(settings.get("direct_hosts", []))
+            if action == "add":
+                h = normalize_host(payload.get("host"))
+                if not h:
+                    self._json({"ok": False, "msg": "域名格式不正确(示例: example.com 或 *.example.com)"})
+                    return
+                if h in hosts:
+                    self._json({"ok": False, "msg": "该域名已在列表中"})
+                    return
+                hosts.append(h)
+            elif action == "remove":
+                h = normalize_host(payload.get("host"))
+                hosts = [x for x in hosts if x != h]
+            elif action == "clear":
+                hosts = []
+            elif action == "preset":
+                # 合并预设, 不覆盖用户自己加的
+                hosts = list(dict.fromkeys(hosts + DIRECT_HOST_PRESET))
+            else:
+                self._json({"ok": False, "msg": "未知操作: " + action})
+                return
+            settings["direct_hosts"] = hosts
+            save_settings()
+            with state_lock:
+                on = (state.get("enabled") and state.get("armed")
+                      and settings.get("route_mode", "tun") == "tun")
+            if on:
+                threading.Thread(target=apply_hosts_runtime, daemon=True).start()
+                self._json({"ok": True, "msg": "正在应用到 WARP(约十几秒, 期间隧道会重连一次)",
+                            "hosts": hosts, "applying": True})
+            else:
+                self._json({"ok": True, "msg": "已保存, 启用分流时自动生效",
+                            "hosts": hosts, "applying": False})
         elif p == "/api/refresh":
             threading.Thread(target=refresh_list, daemon=True).start()
             self._json({"ok": True})

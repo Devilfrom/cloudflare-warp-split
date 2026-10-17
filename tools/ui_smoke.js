@@ -15,8 +15,19 @@ const dom = new JSDOM(html, {
   url: "http://127.0.0.1:8777/",
   virtualConsole: vc,
   beforeParse(window) {
-    // 接口永不 resolve —— 只验证渲染与脚本执行, 不依赖后端
-    window.fetch = () => new Promise(() => {});
+    // 接口默认永不 resolve —— 只验证渲染与脚本执行, 不依赖后端。
+    // /api/hosts 例外: 返回空列表, 让域名卡片走完"空列表占位文案"这条渲染路径。
+    window.fetch = (url) => {
+      if (String(url).includes("/api/hosts")) {
+        return Promise.resolve({
+          json: () => Promise.resolve({
+            hosts: [], daemon_hosts: [], applying: false,
+            enabled: false, preset_count: 28,
+          }),
+        });
+      }
+      return new Promise(() => {});
+    };
     window.localStorage = { getItem: () => null, setItem: () => {} };
   },
 });
@@ -32,8 +43,9 @@ setTimeout(() => {
 
   console.log("== 结构 ==");
   const cards = d.querySelectorAll(".card");
-  ok(cards.length >= 9, "卡片数量 " + cards.length + " (>=9)");
-  ok(d.querySelectorAll(".tile").length === 4, "指标磁贴 4 块");
+  ok(cards.length >= 11, "卡片数量 " + cards.length + " (>=11)");
+  ok(["mCn", "mIntl", "mSpd", "mUp"].every((id) => !!$(id)), "指标磁贴 4 块");
+  ok(d.querySelectorAll("#tunnelCard .tile").length === 4, "隧道磁贴 4 块");
   ok(!!$("chart"), "图表 canvas 存在");
   ok(!!$("switch"), "分流大开关存在");
   ok(!!$("btnRescue") && !!$("btnSelfTest") && !!$("btnRestore"), "关键按钮齐全");
@@ -81,6 +93,27 @@ setTimeout(() => {
   dom.window.checkPanelVer("9.9.9");
   ok(!d.getElementById("panelUpdateBar").classList.contains("hidden"), "版本过旧时弹出提示条");
   ok(/9\.9\.9/.test(d.getElementById("panelUpdateBar").textContent), "提示条含新版本号");
+
+  console.log("== 隧道实时状态 ==");
+  ok(!!$("tunnelCard"), "隧道状态卡片存在");
+  ok(d.getElementById("tunnelCard").style.display === "none", "隧道卡片默认隐藏(未连接不占位)");
+  ok(["tsLat","tsLoss","tsSent","tsRecv","tsProto","tsEp","tsColo","tsTls","tsPq","tsHs"]
+     .every((id) => !!$(id)), "隧道卡片 10 个字段元素齐全");
+  ok(typeof dom.window.loadTunnelStats === "function" && typeof dom.window.fmtBytes === "function",
+     "loadTunnelStats / fmtBytes 已导出到 window");
+  // fmtBytes 单测: B/kB/MB/GB 四档 + null 占位
+  const fb = dom.window.fmtBytes;
+  ok(fb(null) === "—" && fb(512) === "512 B" && fb(2048) === "2.0 kB" &&
+     fb(5 * 1048576) === "5.0 MB" && fb(3 * 1073741824) === "3.00 GB", "fmtBytes 各档格式正确");
+
+  console.log("== 域名级分流 ==");
+  ok(!!$("hostList") && !!$("hostInput"), "域名卡片列表与输入框存在");
+  ok(!!$("btnHostAdd") && !!$("btnHostPreset") && !!$("btnHostClear"), "域名卡片三个按钮齐全");
+  ok(typeof dom.window.loadHosts === "function" && typeof dom.window.hostAction === "function",
+     "loadHosts / hostAction 已导出到 window");
+  ok(/\.hostrow/.test(css) && /\.hostrow \.tag\.ok/.test(css), "域名行样式齐全");
+  // 空列表时给出引导文案(不是空白)
+  ok($("hostList").textContent.length > 0, "空列表有占位引导文案");
 
   console.log("== 样式 ==");
   // 注意: jsdom 的 getComputedStyle 不解析 var(), 新版直接返回字面量,
