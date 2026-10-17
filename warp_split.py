@@ -87,7 +87,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 面板资源版本(与 CHANGELOG / Release 同步, 发新版时改这里)。
 # index.html 头部也带同名标记, ensure_data_files() 靠它判断要不要
 # 自动更新 exe 旁边的旧面板副本。
-PANEL_VERSION = "1.5.0"
+PANEL_VERSION = "1.5.1"
 
 if IS_FROZEN:
     RES_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))

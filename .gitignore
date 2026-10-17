@@ -31,3 +31,6 @@ dist/
 .release-notes.md
 _apnic_tmp.txt
 warp_split.log.*
+
+# pyinstxtractor 解包验证产物(发版前校验内嵌资源用, 勿提交)
+WARP-Split-Console.exe_extracted/

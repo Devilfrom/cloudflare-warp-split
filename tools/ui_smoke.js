@@ -90,9 +90,33 @@ setTimeout(() => {
   // 版本一致 -> 不提示; 版本更新 -> 显示提示条
   dom.window.checkPanelVer(dom.window.__PANEL_VER__);
   ok(d.getElementById("panelUpdateBar").classList.contains("hidden"), "版本一致时不弹提示");
+  {
+    const csD = dom.window.getComputedStyle(d.getElementById("panelUpdateBar"));
+    ok(csD.display === "none", "版本一致时提示条计算样式隐藏(display=" + csD.display + ")");
+  }
   dom.window.checkPanelVer("9.9.9");
   ok(!d.getElementById("panelUpdateBar").classList.contains("hidden"), "版本过旧时弹出提示条");
   ok(/9\.9\.9/.test(d.getElementById("panelUpdateBar").textContent), "提示条含新版本号");
+  // v1.5.1 回归(血的教训): v1.4.1~v1.5.0 只断言 classList 含 hidden,
+  // 没发现 .panel-update-bar 的 display:flex 排在 .hidden 后面、同特异性
+  // 后者胜出 —— 提示条 class 一直在, 计算样式却是 flex, 永远挂在页面上。
+  // 必须断言"计算样式"才算数。
+  {
+    const cs0 = dom.window.getComputedStyle(d.getElementById("panelUpdateBar"));
+    ok(cs0.display !== "none", "提示条弹出时计算样式可见(display=" + cs0.display + ")");
+  }
+  ok(typeof dom.window.dismissPanelUpdate === "function", "dismissPanelUpdate 函数已导出");
+  dom.window.dismissPanelUpdate();
+  {
+    const cs1 = dom.window.getComputedStyle(d.getElementById("panelUpdateBar"));
+    ok(cs1.display === "none", "关闭后提示条计算样式隐藏(display=" + cs1.display + ")");
+  }
+  // sessionStorage 闭锁: 关掉后同标签页内不再弹(重置 _verWarned 验证闭锁本身)
+  dom.window._verWarned = false;
+  dom.window.checkPanelVer("8.8.8");
+  ok(d.getElementById("panelUpdateBar").classList.contains("hidden"), "已关闭后不再重复提示(sessionStorage 闭锁)");
+  // 还原现场: 清掉闭锁标记 + 重新隐藏, 避免影响后续断言
+  try { dom.window.sessionStorage.removeItem("warp_panel_upd_dismissed"); } catch (e) {}
 
   console.log("== 隧道实时状态 ==");
   ok(!!$("tunnelCard"), "隧道状态卡片存在");

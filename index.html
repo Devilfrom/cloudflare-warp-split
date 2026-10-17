@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<!-- warp-split-res v1.5.0  (面板资源版本标记, ensure_data_files() 据此自动更新 exe 旁的旧副本, 勿删) -->
+<!-- warp-split-res v1.5.1  (面板资源版本标记, ensure_data_files() 据此自动更新 exe 旁的旧副本, 勿删) -->
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cloudflare WARP 智能分流控制台</title>
-<script>window.__PANEL_VER__="1.5.0";</script>
+<script>window.__PANEL_VER__="1.5.1";</script>
 <style>
   :root{
     --bg:#0a0e14; --panel:#111823; --panel2:#161f2d; --panel3:#1c2634;
@@ -230,7 +230,11 @@
     box-shadow:0 12px 32px rgba(0,0,0,.4);backdrop-filter:blur(8px);
   }
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-  .hidden{display:none}
+  /* 工具类: !important 是必须的 —— 组件 CSS(如 .panel-update-bar 的
+     display:flex)与 .hidden 特异性相同, 排在后面的会赢, 不加 !important
+     hidden 会被组件覆盖导致"该藏的元素永远可见"(v1.5.1 修的正是这个:
+     v1.4.1 起版本提示条因此一直显示, 用户狂刷也没用)。 */
+  .hidden{display:none!important}
 
   @media(max-width:760px){
     .grid{grid-template-columns:1fr}
@@ -329,15 +333,21 @@
     display:flex;align-items:center;gap:12px;padding:10px 16px;border-radius:12px;
     background:var(--accent);color:#fff;font-size:13px;font-weight:600;
     box-shadow:0 8px 28px rgba(0,0,0,.35)}
+  /* 双保险: 复合选择器特异性(0,2,0)稳压 .panel-update-bar 的 display:flex,
+     不依赖 !important 的解析(某些测试环境/旧内核对 important 支持不完整) */
+  .panel-update-bar.hidden{display:none}
   .panel-update-bar button{background:rgba(255,255,255,.22);border:0;color:#fff;
     padding:5px 14px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600}
   .panel-update-bar button:hover{background:rgba(255,255,255,.34)}
+  .panel-update-bar button.x{background:transparent;padding:2px 7px;font-size:15px;line-height:1}
+  .panel-update-bar button.x:hover{background:rgba(255,255,255,.22)}
 </style>
 </head>
 <body>
 <div id="panelUpdateBar" class="panel-update-bar hidden">
   <span>检测到新版本面板</span>
   <button onclick="location.reload()">立即刷新</button>
+  <button class="x" onclick="dismissPanelUpdate()" title="关闭此提示(本标签页内不再显示)">×</button>
 </div>
 <div class="wrap">
   <header>
@@ -838,9 +848,17 @@ function loadStatus(){
 // 解决"重启了程序但面板看着没更新"的体感问题。
 // v1.4.5: 去掉 document.hidden 条件 —— 后台标签页同样需要自愈,
 // 否则挂着的提示条会一直在那里, 用户每次切回该标签页都看到"检测到新版本"。
+// v1.5.1: 提示条可手动关闭(×), 且关闭后本标签页不再烦人;
+// 另外 .hidden 加了 !important —— v1.4.1 起 .panel-update-bar 的
+// display:flex 一直覆盖 .hidden, 提示条其实永远可见, 与版本无关。
 var _verWarned=false;
+function dismissPanelUpdate(){
+  var bar=$("panelUpdateBar"); if(bar) bar.classList.add("hidden");
+  try{ sessionStorage.setItem("warp_panel_upd_dismissed","1"); }catch(e){}
+}
 function checkPanelVer(v){
   if(!v || v===window.__PANEL_VER__ || _verWarned) return;
+  try{ if(sessionStorage.getItem("warp_panel_upd_dismissed")) return; }catch(e){}
   _verWarned=true;
   var bar=$("panelUpdateBar"); if(!bar) return;
   bar.querySelector("span").textContent="检测到新版本面板 v"+v+"（当前页面 v"+window.__PANEL_VER__+"），即将自动刷新";
